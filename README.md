@@ -57,7 +57,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 Webhook 驗證 URL：
-- `GET /webhook?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...`
+- `GET /api/webhook?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...`
 
 ## 5. Vercel 部署（無 CLI）
 
@@ -66,12 +66,12 @@ Webhook 驗證 URL：
 3. 在 Vercel 設定同一組環境變數
 4. 重新部署
 5. 在 Meta Developer 後台把 Webhook 指向：
-- `https://<your-vercel-domain>/webhook`
+- `https://<your-vercel-domain>/api/webhook`
 
 ## 6. 每日推播
 
 `vercel.json` 已加 cron：
-- `0 1 * * *`（即香港時間每日 09:00）呼叫 `/internal/daily-push`
+- `0 1 * * *`（即香港時間每日 09:00）呼叫 `/api/internal/daily-push`
 
 保護方式：
 - 設定 `CRON_SECRET`
