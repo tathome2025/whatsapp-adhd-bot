@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,6 +24,13 @@ class Settings(BaseSettings):
     cron_secret: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    @field_validator("max_daily_tasks", mode="before")
+    @classmethod
+    def normalize_max_daily_tasks(cls, value: object) -> int:
+        if value in (None, ""):
+            return 6
+        return int(value)
 
     @property
     def supabase_rest_url(self) -> str:
