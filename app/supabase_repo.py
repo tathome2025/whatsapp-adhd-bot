@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -112,7 +112,7 @@ class SupabaseRepo:
     async def mark_done(self, chat_id: str, task_id: int) -> dict[str, Any] | None:
         payload = {
             "status": "done",
-            "completed_at": datetime.now(UTC).isoformat(),
+            "completed_at": datetime.now(timezone.utc).isoformat(),
         }
         updated = await self._request(
             "PATCH",

@@ -1,5 +1,5 @@
 import re
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import dateparser
@@ -113,7 +113,7 @@ def parse_task_text(text: str, timezone_name: str) -> ParsedTask:
     if not title and due_local:
         title = "未命名任務"
 
-    due_at_utc = due_local.astimezone(UTC).isoformat() if due_local else None
+    due_at_utc = due_local.astimezone(timezone.utc).isoformat() if due_local else None
 
     return ParsedTask(
         title=title,

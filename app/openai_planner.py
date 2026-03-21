@@ -1,6 +1,6 @@
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -134,7 +134,7 @@ class OpenAIPlanner:
             "reasons": parsed.get("reasons", []),
             "suggested_time_blocks": parsed.get("suggested_time_blocks", []),
             "fallback": False,
-            "generated_at": datetime.now(UTC).isoformat(),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
         }
 
     @staticmethod

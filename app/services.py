@@ -1,5 +1,5 @@
 import re
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -175,8 +175,8 @@ class TaskService:
         start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
         end_local = start_local + timedelta(days=1)
 
-        start_utc = start_local.astimezone(UTC).isoformat()
-        end_utc = end_local.astimezone(UTC).isoformat()
+        start_utc = start_local.astimezone(timezone.utc).isoformat()
+        end_utc = end_local.astimezone(timezone.utc).isoformat()
 
         return await self.repo.list_tasks_for_date(chat_id, start_utc, end_utc)
 
