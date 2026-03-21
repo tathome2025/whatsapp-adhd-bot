@@ -58,7 +58,6 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 Webhook 驗證 URL：
 - `GET /webhook?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...`
-- 相容路徑：`/api/webhook`（由 rewrite 轉發）
 
 ## 5. Vercel 部署（無 CLI）
 
