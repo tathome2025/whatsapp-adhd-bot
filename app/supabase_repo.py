@@ -192,3 +192,23 @@ class SupabaseRepo:
             },
             prefer="return=minimal",
         )
+
+    async def health_check(self) -> dict[str, Any]:
+        if not self.settings.supabase_url or not self.settings.supabase_service_role_key:
+            return {
+                "ok": False,
+                "error": "SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing",
+            }
+
+        try:
+            await self._request(
+                "GET",
+                "tasks",
+                params={
+                    "select": "id",
+                    "limit": "1",
+                },
+            )
+            return {"ok": True}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}

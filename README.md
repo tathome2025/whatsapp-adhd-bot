@@ -86,7 +86,15 @@ Webhook 驗證 URL：
 - `done 3`: 完成任務 #3
 - 自然語言：`下星期二 3pm 同客開會`
 
-## 8. ADHD 排程設計
+## 8. 狀態頁（Web UI）
+
+- `GET /status`: 伺服器狀態看板（黑/白/灰/橙）
+- `GET /status.json`: 狀態 JSON
+- 會顯示：
+  - App / Supabase / Webhook / OpenAI / Cron 是否就緒
+  - 哪些 env 還未設定
+
+## 9. ADHD 排程設計
 
 流程：
 1. 先取出當日任務
@@ -99,7 +107,7 @@ Webhook 驗證 URL：
 - `reasons`
 - `suggested_time_blocks`
 
-## 9. 視覺主調（若日後做 Dashboard）
+## 10. 視覺主調（若日後做 Dashboard）
 
 建議色票（黑/白/灰/橙）：
 - `#111111`
