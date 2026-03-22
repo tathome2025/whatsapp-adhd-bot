@@ -94,7 +94,13 @@ Webhook 驗證 URL：
   - App / Supabase / Webhook / OpenAI / Cron 是否就緒
   - 哪些 env 還未設定
 
-## 9. ADHD 排程設計
+## 9. 法務頁（Meta 用）
+
+- `GET /privacy`: Privacy Policy
+- `GET /data-deletion`: Data Deletion Instructions
+- 建議在 Vercel 設定 `PRIVACY_CONTACT_EMAIL` 作為聯絡電郵
+
+## 10. ADHD 排程設計
 
 流程：
 1. 先取出當日任務
@@ -107,7 +113,7 @@ Webhook 驗證 URL：
 - `reasons`
 - `suggested_time_blocks`
 
-## 10. 視覺主調（若日後做 Dashboard）
+## 11. 視覺主調（若日後做 Dashboard）
 
 建議色票（黑/白/灰/橙）：
 - `#111111`

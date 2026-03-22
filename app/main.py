@@ -34,6 +34,72 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/privacy", response_class=HTMLResponse)
+async def privacy_policy() -> str:
+    contact_email = escape(os.getenv("PRIVACY_CONTACT_EMAIL", "support@example.com"))
+    content = f"""
+    <h2>1. What We Collect</h2>
+    <ul>
+      <li>WhatsApp phone number and message metadata</li>
+      <li>Task content you send to the bot (title, due date/time, priority)</li>
+      <li>Operational logs required for reliability and debugging</li>
+    </ul>
+
+    <h2>2. Why We Collect It</h2>
+    <ul>
+      <li>Create and manage your to-do tasks</li>
+      <li>Send reminders and daily schedules</li>
+      <li>Improve prioritization quality and service reliability</li>
+    </ul>
+
+    <h2>3. Third-Party Processors</h2>
+    <ul>
+      <li>Meta WhatsApp Cloud API (message delivery)</li>
+      <li>Supabase (data storage)</li>
+      <li>OpenAI API (task ordering assistance)</li>
+    </ul>
+
+    <h2>4. Data Retention</h2>
+    <p>Data is retained only as long as needed to provide the service, unless a longer period is required by law.</p>
+
+    <h2>5. Data Deletion</h2>
+    <p>You can request deletion at any time. See <a href="/data-deletion">Data Deletion Instructions</a>.</p>
+
+    <h2>6. Contact</h2>
+    <p>For privacy requests, contact: <a href="mailto:{contact_email}">{contact_email}</a></p>
+
+    <h2>7. Effective Date</h2>
+    <p>2026-03-23</p>
+    """
+    return _render_legal_page("Privacy Policy", content)
+
+
+@app.get("/data-deletion", response_class=HTMLResponse)
+async def data_deletion_instructions() -> str:
+    contact_email = escape(os.getenv("PRIVACY_CONTACT_EMAIL", "support@example.com"))
+    content = f"""
+    <h2>How to Request Data Deletion</h2>
+    <ol>
+      <li>Send a WhatsApp message to this bot with: <code>delete my data</code>, or</li>
+      <li>Email <a href="mailto:{contact_email}">{contact_email}</a> from your registered contact and include your WhatsApp number.</li>
+    </ol>
+
+    <h2>What Will Be Deleted</h2>
+    <ul>
+      <li>Task records linked to your WhatsApp number</li>
+      <li>User profile settings used for scheduling</li>
+      <li>Stored daily plan outputs</li>
+    </ul>
+
+    <h2>Processing Time</h2>
+    <p>Requests are typically processed within 7 business days.</p>
+
+    <h2>Effective Date</h2>
+    <p>2026-03-23</p>
+    """
+    return _render_legal_page("Data Deletion Instructions", content)
+
+
 @app.get("/status.json")
 async def status_json() -> dict[str, object]:
     return await _build_status_snapshot()
@@ -339,6 +405,64 @@ def _render_status_html(snapshot: dict[str, object]) -> str:
       <p class="meta" style="margin-top:12px;">
         JSON endpoint: <a href="/status.json">/status.json</a>
       </p>
+    </div>
+  </body>
+</html>
+"""
+
+
+def _render_legal_page(title: str, content: str) -> str:
+    safe_title = escape(title)
+    return f"""
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{safe_title}</title>
+    <style>
+      :root {{
+        --bg: #111111;
+        --panel: #1f1f1f;
+        --text: #ffffff;
+        --muted: #9ca3af;
+        --line: #374151;
+        --accent: #f97316;
+      }}
+      * {{ box-sizing: border-box; }}
+      body {{
+        margin: 0;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: linear-gradient(180deg, #0f0f0f 0%, #181818 100%);
+        color: var(--text);
+        padding: 24px;
+      }}
+      .container {{
+        max-width: 900px;
+        margin: 0 auto;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 20px;
+      }}
+      h1 {{ margin-top: 0; }}
+      h2 {{ margin-top: 24px; font-size: 18px; }}
+      p, li {{ color: #e5e7eb; line-height: 1.65; }}
+      .muted {{ color: var(--muted); font-size: 13px; }}
+      a {{ color: var(--accent); }}
+      code {{
+        background: #2b2b2b;
+        border: 1px solid #444;
+        border-radius: 6px;
+        padding: 2px 6px;
+      }}
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>{safe_title}</h1>
+      <p class="muted">This page is publicly accessible and intended for Meta app compliance.</p>
+      {content}
     </div>
   </body>
 </html>
