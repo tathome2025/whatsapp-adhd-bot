@@ -87,7 +87,13 @@ class TaskService:
             plan = await self.planner.rank_tasks_for_adhd(chat_id, today_tasks, profile)
             limited_tasks = plan["ordered_tasks"][: int(profile.get("max_daily_tasks") or self.settings.max_daily_tasks)]
 
-            message = self._format_today_message(limited_tasks, timezone_name, plan.get("reasons", []), push_mode=True)
+            message = self._format_today_message(
+                limited_tasks,
+                timezone_name,
+                plan.get("reasons", []),
+                push_mode=True,
+                ai_sorted=not bool(plan.get("fallback", False)),
+            )
             await self.whatsapp_client.send_text_message(chat_id, message)
 
             await self.repo.save_daily_plan(
@@ -159,7 +165,13 @@ class TaskService:
         max_daily = int(profile.get("max_daily_tasks") or self.settings.max_daily_tasks)
         limited_tasks = plan["ordered_tasks"][:max_daily]
 
-        return self._format_today_message(limited_tasks, timezone_name, plan.get("reasons", []), push_mode=False)
+        return self._format_today_message(
+            limited_tasks,
+            timezone_name,
+            plan.get("reasons", []),
+            push_mode=False,
+            ai_sorted=not bool(plan.get("fallback", False)),
+        )
 
     async def _cmd_done_many(self, chat_id: str, task_ids: list[int]) -> str:
         completed: list[tuple[int, str]] = []
@@ -217,9 +229,12 @@ class TaskService:
         reasons: list[str],
         *,
         push_mode: bool,
+        ai_sorted: bool,
     ) -> str:
         title = "今日工作清單" if push_mode else "今天建議執行順序"
         lines = [f"{title}："]
+        if ai_sorted:
+            lines.append("（由AI排序）")
 
         for index, task in enumerate(tasks, start=1):
             due_label = _format_due(task.get("due_at"), timezone_name)
