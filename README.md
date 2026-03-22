@@ -2,7 +2,7 @@
 
 這是一個可部署在 Vercel 的 WhatsApp 工作任務機器人，支援：
 - 自然語言轉任務（日期、時間、優先度）
-- `list` / `today` / `done <id>` 指令
+- `list` / `today` / `done <id...>` / `edit <id> <text>` 指令
 - 每日推播今日任務
 - 串接 OpenAI API，按 ADHD 友善方式安排順序
 
@@ -24,6 +24,7 @@ vercel.json                # Vercel routes + cron
 
 1. 在 Supabase Dashboard 建立專案
 2. 打開 SQL Editor，貼上 [`supabase/schema.sql`](supabase/schema.sql)
+   (如你已有舊資料庫，請重新執行一次作 migration，會加入 `task_no` 與 `edit` 需要欄位)
 3. 執行後取得：
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
@@ -83,7 +84,9 @@ Webhook 驗證 URL：
 
 - `list`: 列出所有待辦
 - `today`: 今日建議順序（會嘗試用 OpenAI 排序）
-- `done 3`: 完成任務 #3
+- `done 3 5 8`: 一次完成多項任務
+- `edit 3 明天 4pm 跟客開會`: 修改任務 #3 內容
+- 任務編號 `#id` 以每個電話號碼（chat）獨立重新計數
 - 自然語言：`下星期二 3pm 同客開會`
 
 ## 8. 狀態頁（Web UI）

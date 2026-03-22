@@ -62,9 +62,10 @@ class TaskService:
 
         due_label = _format_due(created.get("due_at"), timezone_name)
         priority_label = PRIORITY_LABELS.get(int(created.get("priority", 2)), "中")
+        display_no = _task_no(created)
 
         lines = [
-            f"已加入任務 #{created['id']}",
+            f"已加入任務 #{display_no}",
             f"內容：{created['title']}",
             f"時間：{due_label}",
             f"優先度：{priority_label}",
@@ -130,6 +131,13 @@ class TaskService:
         if normalized in {"help", "/help"}:
             return self._cmd_help()
 
+        edit_match = re.match(r"^/?edit\s+(\d+)\s+(.+)$", raw, flags=re.IGNORECASE | re.DOTALL)
+        if edit_match:
+            return await self._cmd_edit(chat_id, int(edit_match.group(1)), edit_match.group(2).strip())
+
+        if re.match(r"^/?edit\b", raw, flags=re.IGNORECASE):
+            return "請用：edit <id> <新內容>，例如：edit 3 明天 4pm 跟客開會。"
+
         done_match = re.match(r"^/?done\b(.*)$", raw, flags=re.IGNORECASE)
         if done_match:
             task_ids = _parse_task_ids(done_match.group(1))
@@ -153,7 +161,7 @@ class TaskService:
         for task in tasks[:30]:
             due_label = _format_due(task.get("due_at"), timezone_name)
             priority = PRIORITY_LABELS.get(int(task.get("priority", 2)), "中")
-            lines.append(f"#{task['id']} [{priority}] {task['title']}｜{due_label}")
+            lines.append(f"#{_task_no(task)} [{priority}] {task['title']}｜{due_label}")
 
         if len(tasks) > 30:
             lines.append(f"... 另有 {len(tasks) - 30} 項")
@@ -184,12 +192,12 @@ class TaskService:
         completed: list[tuple[int, str]] = []
         not_found: list[int] = []
 
-        for task_id in task_ids:
-            updated = await self.repo.mark_done(chat_id, task_id)
+        for task_no in task_ids:
+            updated = await self.repo.mark_done_by_task_no(chat_id, task_no)
             if not updated:
-                not_found.append(task_id)
+                not_found.append(task_no)
                 continue
-            completed.append((task_id, str(updated.get("title") or "")))
+            completed.append((task_no, str(updated.get("title") or "")))
 
         if not completed and len(task_ids) == 1:
             return f"找不到可完成的任務 #{task_ids[0]}。"
@@ -198,16 +206,50 @@ class TaskService:
 
         if completed:
             lines.append(f"已完成 {len(completed)} 項任務：")
-            for task_id, title in completed[:20]:
-                lines.append(f"- #{task_id} {title}")
+            for task_no, title in completed[:20]:
+                lines.append(f"- #{task_no} {title}")
             if len(completed) > 20:
                 lines.append(f"... 另有 {len(completed) - 20} 項已完成")
 
         if not_found:
-            missed = ", ".join(f"#{task_id}" for task_id in not_found)
+            missed = ", ".join(f"#{task_no}" for task_no in not_found)
             lines.append(f"未找到或已完成：{missed}")
 
         return "\n".join(lines) if lines else "找不到可完成的任務。"
+
+    async def _cmd_edit(self, chat_id: str, task_no: int, new_text: str) -> str:
+        profile = await self.repo.get_user_profile(chat_id)
+        timezone_name = profile.get("timezone") or self.settings.timezone
+
+        existing = await self.repo.get_open_task_by_task_no(chat_id, task_no)
+        if not existing:
+            return f"找不到可編輯的任務 #{task_no}。"
+
+        parsed = parse_task_text(new_text, timezone_name)
+        if not parsed.title:
+            return "我未能解析新內容，請用例如：edit 3 明天 4pm 跟客開會。"
+
+        patch = {
+            "title": parsed.title,
+            "due_at": parsed.due_at_utc if parsed.due_at_utc is not None else existing.get("due_at"),
+            "priority": parsed.priority,
+            "effort_min": parsed.effort_min,
+            "energy_need": parsed.energy_need,
+            "source_text": new_text,
+        }
+
+        updated = await self.repo.update_task_by_task_no(chat_id, task_no, patch)
+        if not updated:
+            return f"找不到可編輯的任務 #{task_no}。"
+
+        due_label = _format_due(updated.get("due_at"), timezone_name)
+        priority_label = PRIORITY_LABELS.get(int(updated.get("priority", 2)), "中")
+        return (
+            f"已更新任務 #{_task_no(updated)}\n"
+            f"內容：{updated['title']}\n"
+            f"時間：{due_label}\n"
+            f"優先度：{priority_label}"
+        )
 
     def _cmd_help(self) -> str:
         return (
@@ -215,6 +257,7 @@ class TaskService:
             "list - 查看全部待辦\n"
             "today - 查看今日任務\n"
             "done <id ...> - 完成一個或多個任務（例：done 3 5 8）\n"
+            "edit <id> <新內容> - 更新任務（例：edit 3 明天 4pm 跟客開會）\n"
             "\n自然語言例子：下星期二 3pm 同客開會"
         )
 
@@ -234,10 +277,10 @@ class TaskService:
             ai_sorted = not bool(plan.get("fallback", False))
             method_label = "由AI排序" if ai_sorted else "由規則排序"
 
-            created_id = int(created_task.get("id") or 0)
+            created_ref = _task_no(created_task)
             created_position: int | None = None
             for index, task in enumerate(ordered_tasks, start=1):
-                if int(task.get("id") or 0) == created_id:
+                if _task_no(task) == created_ref:
                     created_position = index
                     break
 
@@ -262,7 +305,7 @@ class TaskService:
 
         lines = ["目前建議前 3 項："]
         for index, task in enumerate(tasks[:3], start=1):
-            lines.append(f"{index}. #{task['id']} {task['title']}")
+            lines.append(f"{index}. #{_task_no(task)} {task['title']}")
         return "\n".join(lines)
 
     async def _get_today_tasks(self, chat_id: str, timezone_name: str) -> list[dict[str, Any]]:
@@ -293,7 +336,7 @@ class TaskService:
         for index, task in enumerate(tasks, start=1):
             due_label = _format_due(task.get("due_at"), timezone_name)
             priority = PRIORITY_LABELS.get(int(task.get("priority", 2)), "中")
-            lines.append(f"{index}. #{task['id']} [{priority}] {task['title']}｜{due_label}")
+            lines.append(f"{index}. #{_task_no(task)} [{priority}] {task['title']}｜{due_label}")
 
         if reasons:
             lines.append("\n排序理由：")
@@ -312,6 +355,13 @@ def _parse_task_ids(raw_text: str) -> list[int]:
         if task_id not in ids:
             ids.append(task_id)
     return ids
+
+
+def _task_no(task: dict[str, Any]) -> int:
+    raw = task.get("task_no")
+    if raw not in (None, ""):
+        return int(raw)
+    return int(task.get("id") or 0)
 
 
 def _format_due(due_at_iso: str | None, timezone_name: str) -> str:

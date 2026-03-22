@@ -111,6 +111,20 @@ class SupabaseRepo:
         )
         return data or []
 
+    async def get_open_task_by_task_no(self, chat_id: str, task_no: int) -> dict[str, Any] | None:
+        tasks = await self._request(
+            "GET",
+            "tasks",
+            params={
+                "select": "*",
+                "chat_id": f"eq.{chat_id}",
+                "task_no": f"eq.{task_no}",
+                "status": "eq.open",
+                "limit": "1",
+            },
+        )
+        return tasks[0] if tasks else None
+
     async def mark_done(self, chat_id: str, task_id: int) -> dict[str, Any] | None:
         payload = {
             "status": "done",
@@ -125,6 +139,43 @@ class SupabaseRepo:
                 "status": "eq.open",
             },
             json_data=payload,
+            prefer="return=representation",
+        )
+        return updated[0] if updated else None
+
+    async def mark_done_by_task_no(self, chat_id: str, task_no: int) -> dict[str, Any] | None:
+        payload = {
+            "status": "done",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        updated = await self._request(
+            "PATCH",
+            "tasks",
+            params={
+                "chat_id": f"eq.{chat_id}",
+                "task_no": f"eq.{task_no}",
+                "status": "eq.open",
+            },
+            json_data=payload,
+            prefer="return=representation",
+        )
+        return updated[0] if updated else None
+
+    async def update_task_by_task_no(
+        self,
+        chat_id: str,
+        task_no: int,
+        patch: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        updated = await self._request(
+            "PATCH",
+            "tasks",
+            params={
+                "chat_id": f"eq.{chat_id}",
+                "task_no": f"eq.{task_no}",
+                "status": "eq.open",
+            },
+            json_data=patch,
             prefer="return=representation",
         )
         return updated[0] if updated else None
