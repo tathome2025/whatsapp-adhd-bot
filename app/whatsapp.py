@@ -38,6 +38,23 @@ class WhatsAppClient:
             resp = await client.post(self.message_api_url, headers=headers, json=payload)
         resp.raise_for_status()
 
+    async def health_check(self) -> dict[str, str | bool]:
+        if not self.settings.whatsapp_access_token or not self.settings.whatsapp_phone_number_id:
+            return {"ok": False, "error": "WHATSAPP_ACCESS_TOKEN or WHATSAPP_PHONE_NUMBER_ID is missing"}
+
+        url = f"https://graph.facebook.com/v20.0/{self.settings.whatsapp_phone_number_id}"
+        headers = {"Authorization": f"Bearer {self.settings.whatsapp_access_token}"}
+        params = {"fields": "id,display_phone_number"}
+
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.get(url, headers=headers, params=params)
+            resp.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+
+        return {"ok": True}
+
 
 def extract_inbound_messages(payload: dict[str, Any]) -> list[InboundMessage]:
     messages: list[InboundMessage] = []

@@ -28,6 +28,14 @@ service = TaskService(settings, repo, whatsapp_client, planner)
 
 app = FastAPI(title="WhatsApp ADHD Task Bot", version="0.1.0")
 
+WEBHOOK_RUNTIME: dict[str, object] = {
+    "last_attempt_utc": "",
+    "last_status": "none",
+    "last_error": "",
+    "last_messages_count": 0,
+    "last_processed": 0,
+}
+
 
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
@@ -125,20 +133,26 @@ async def verify_webhook(request: Request) -> str:
 
 @app.post("/webhook")
 async def receive_webhook(request: Request) -> dict[str, int | str]:
+    _update_webhook_runtime(last_status="received", last_error="", last_messages_count=0, last_processed=0)
+
     raw_body = await request.body()
     signature = request.headers.get("x-hub-signature-256")
 
     if not _verify_signature(raw_body, signature):
+        _update_webhook_runtime(last_status="invalid_signature", last_error="x-hub-signature-256 mismatch")
         raise HTTPException(status_code=401, detail="Invalid signature")
 
     try:
         payload = json.loads(raw_body.decode("utf-8"))
     except json.JSONDecodeError as exc:
         logger.warning("Invalid JSON payload: %s", exc)
+        _update_webhook_runtime(last_status="invalid_json", last_error=str(exc))
         raise HTTPException(status_code=400, detail="Invalid JSON") from exc
 
     messages = extract_inbound_messages(payload)
     processed = 0
+    failed = 0
+    _update_webhook_runtime(last_status="processing", last_messages_count=len(messages), last_processed=0, last_error="")
 
     for message in messages:
         try:
@@ -150,9 +164,19 @@ async def receive_webhook(request: Request) -> dict[str, int | str]:
             await whatsapp_client.send_text_message(message.chat_id, reply)
             processed += 1
         except Exception as exc:  # noqa: BLE001
+            failed += 1
             logger.exception("Failed to process message %s: %s", message.message_id, exc)
 
-    return {"status": "ok", "processed": processed}
+    runtime_status = "ok" if failed == 0 else "partial_error"
+    runtime_error = "" if failed == 0 else f"{failed} message(s) failed"
+    _update_webhook_runtime(
+        last_status=runtime_status,
+        last_messages_count=len(messages),
+        last_processed=processed,
+        last_error=runtime_error,
+    )
+
+    return {"status": "ok", "processed": processed, "failed": failed}
 
 
 @app.get("/internal/daily-push")
@@ -204,6 +228,50 @@ def _is_configured(value: str) -> bool:
     return bool(value and value.strip())
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _update_webhook_runtime(
+    *,
+    last_status: str,
+    last_error: str,
+    last_messages_count: int | None = None,
+    last_processed: int | None = None,
+) -> None:
+    WEBHOOK_RUNTIME["last_attempt_utc"] = _utc_now_iso()
+    WEBHOOK_RUNTIME["last_status"] = last_status
+    WEBHOOK_RUNTIME["last_error"] = last_error
+    if last_messages_count is not None:
+        WEBHOOK_RUNTIME["last_messages_count"] = int(last_messages_count)
+    if last_processed is not None:
+        WEBHOOK_RUNTIME["last_processed"] = int(last_processed)
+
+
+def _webhook_runtime_check() -> dict[str, object]:
+    last_status = str(WEBHOOK_RUNTIME.get("last_status", "none"))
+    last_attempt = str(WEBHOOK_RUNTIME.get("last_attempt_utc", ""))
+    last_error = str(WEBHOOK_RUNTIME.get("last_error", ""))
+    last_messages = int(WEBHOOK_RUNTIME.get("last_messages_count", 0) or 0)
+    last_processed = int(WEBHOOK_RUNTIME.get("last_processed", 0) or 0)
+
+    if last_status == "none":
+        return {
+            "ok": True,
+            "detail": "No webhook events seen since current instance started",
+        }
+
+    ok = last_status not in {"invalid_signature", "invalid_json", "partial_error"}
+    detail = f"status={last_status}, processed={last_processed}/{last_messages}, at={last_attempt}"
+    if last_error:
+        detail = f"{detail}, error={last_error}"
+
+    return {
+        "ok": ok,
+        "detail": detail,
+    }
+
+
 async def _build_status_snapshot() -> dict[str, object]:
     env_status = {
         "WHATSAPP_ACCESS_TOKEN": _is_configured(settings.whatsapp_access_token),
@@ -217,6 +285,7 @@ async def _build_status_snapshot() -> dict[str, object]:
     }
 
     supabase = await repo.health_check()
+    whatsapp_api = await whatsapp_client.health_check()
 
     checks = {
         "app": {"ok": True, "detail": "FastAPI route is reachable"},
@@ -233,6 +302,8 @@ async def _build_status_snapshot() -> dict[str, object]:
             "ok": env_status["WHATSAPP_ACCESS_TOKEN"] and env_status["WHATSAPP_PHONE_NUMBER_ID"],
             "detail": "Required to send messages via Cloud API",
         },
+        "whatsapp_api": whatsapp_api,
+        "webhook_runtime": _webhook_runtime_check(),
         "openai_ready": {
             "ok": env_status["OPENAI_API_KEY"],
             "detail": "Used for ADHD ranking",
@@ -244,11 +315,11 @@ async def _build_status_snapshot() -> dict[str, object]:
     }
 
     missing_env = [name for name, ok in env_status.items() if not ok]
-    healthy = all(item.get("ok") for item in checks.values())
+    healthy = all(bool(item.get("ok")) for item in checks.values())
 
     return {
         "healthy": healthy,
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "timestamp_utc": _utc_now_iso(),
         "deployment_url": os.getenv("VERCEL_URL", ""),
         "git_commit_sha": os.getenv("VERCEL_GIT_COMMIT_SHA", ""),
         "timezone": settings.timezone,
