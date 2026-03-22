@@ -62,12 +62,19 @@ class TaskService:
 
         due_label = _format_due(created.get("due_at"), timezone_name)
         priority_label = PRIORITY_LABELS.get(int(created.get("priority", 2)), "中")
-        return (
-            f"已加入任務 #{created['id']}\n"
-            f"內容：{created['title']}\n"
-            f"時間：{due_label}\n"
-            f"優先度：{priority_label}"
-        )
+
+        lines = [
+            f"已加入任務 #{created['id']}",
+            f"內容：{created['title']}",
+            f"時間：{due_label}",
+            f"優先度：{priority_label}",
+        ]
+
+        order_hint = await self._build_new_task_order_hint(chat_id, created, profile)
+        if order_hint:
+            lines.append(order_hint)
+
+        return "\n".join(lines)
 
     async def push_daily_plans(self) -> dict[str, int]:
         pushed = 0
@@ -210,6 +217,53 @@ class TaskService:
             "done <id ...> - 完成一個或多個任務（例：done 3 5 8）\n"
             "\n自然語言例子：下星期二 3pm 同客開會"
         )
+
+    async def _build_new_task_order_hint(
+        self,
+        chat_id: str,
+        created_task: dict[str, Any],
+        profile: dict[str, Any],
+    ) -> str:
+        try:
+            open_tasks = await self.repo.list_open_tasks(chat_id, limit=100)
+            if not open_tasks:
+                return ""
+
+            plan = await self.planner.rank_tasks_for_adhd(chat_id, open_tasks, profile)
+            ordered_tasks = plan.get("ordered_tasks") or open_tasks
+            ai_sorted = not bool(plan.get("fallback", False))
+            method_label = "由AI排序" if ai_sorted else "由規則排序"
+
+            created_id = int(created_task.get("id") or 0)
+            created_position: int | None = None
+            for index, task in enumerate(ordered_tasks, start=1):
+                if int(task.get("id") or 0) == created_id:
+                    created_position = index
+                    break
+
+            lines: list[str] = []
+            if created_position is not None:
+                lines.append(f"建議次序：第 {created_position} 位（{method_label}）")
+            else:
+                lines.append(f"已納入建議清單（{method_label}）")
+
+            preview = self._format_top_tasks_preview(ordered_tasks)
+            if preview:
+                lines.append(preview)
+
+            return "\n".join(lines)
+        except Exception:  # noqa: BLE001
+            return ""
+
+    @staticmethod
+    def _format_top_tasks_preview(tasks: list[dict[str, Any]]) -> str:
+        if not tasks:
+            return ""
+
+        lines = ["目前建議前 3 項："]
+        for index, task in enumerate(tasks[:3], start=1):
+            lines.append(f"{index}. #{task['id']} {task['title']}")
+        return "\n".join(lines)
 
     async def _get_today_tasks(self, chat_id: str, timezone_name: str) -> list[dict[str, Any]]:
         local_tz = ZoneInfo(timezone_name)

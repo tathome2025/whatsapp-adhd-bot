@@ -65,6 +65,7 @@ class OpenAIPlanner:
             {
                 "id": t["id"],
                 "title": t["title"],
+                "source_text": t.get("source_text"),
                 "due_at": t.get("due_at"),
                 "priority": t.get("priority", 2),
                 "effort_min": t.get("effort_min"),
@@ -80,7 +81,10 @@ class OpenAIPlanner:
             "focus_window": profile.get("focus_window", "09:00-12:00"),
             "break_pref": profile.get("break_pref", "25-5"),
             "tasks": task_input,
-            "goal": "輸出 ADHD 友善的今日執行順序，先易後難啟動、兼顧截止時間。",
+            "goal": (
+                "根據任務自然語言內容（source_text/title）、截止時間、優先度、預估投入時間，"
+                "輸出 ADHD 友善的執行順序（先易後難啟動，兼顧 deadline）。"
+            ),
         }
 
         payload = {
