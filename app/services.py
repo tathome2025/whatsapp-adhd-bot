@@ -117,9 +117,14 @@ class TaskService:
         if normalized in {"help", "/help"}:
             return self._cmd_help()
 
-        match = re.match(r"^/?done\s+(\d+)\s*$", normalized)
-        if match:
-            return await self._cmd_done(chat_id, int(match.group(1)))
+        done_match = re.match(r"^/?done\b(.*)$", raw, flags=re.IGNORECASE)
+        if done_match:
+            task_ids = _parse_task_ids(done_match.group(1))
+            if not task_ids:
+                return "請提供任務 ID，例如：done 3 或 done 3 5 8。"
+            if len(task_ids) > 30:
+                return "一次最多可完成 30 項任務，請分批執行。"
+            return await self._cmd_done_many(chat_id, task_ids)
 
         return None
 
@@ -156,18 +161,41 @@ class TaskService:
 
         return self._format_today_message(limited_tasks, timezone_name, plan.get("reasons", []), push_mode=False)
 
-    async def _cmd_done(self, chat_id: str, task_id: int) -> str:
-        updated = await self.repo.mark_done(chat_id, task_id)
-        if not updated:
-            return f"找不到可完成的任務 #{task_id}。"
-        return f"已完成任務 #{task_id}：{updated['title']}"
+    async def _cmd_done_many(self, chat_id: str, task_ids: list[int]) -> str:
+        completed: list[tuple[int, str]] = []
+        not_found: list[int] = []
+
+        for task_id in task_ids:
+            updated = await self.repo.mark_done(chat_id, task_id)
+            if not updated:
+                not_found.append(task_id)
+                continue
+            completed.append((task_id, str(updated.get("title") or "")))
+
+        if not completed and len(task_ids) == 1:
+            return f"找不到可完成的任務 #{task_ids[0]}。"
+
+        lines: list[str] = []
+
+        if completed:
+            lines.append(f"已完成 {len(completed)} 項任務：")
+            for task_id, title in completed[:20]:
+                lines.append(f"- #{task_id} {title}")
+            if len(completed) > 20:
+                lines.append(f"... 另有 {len(completed) - 20} 項已完成")
+
+        if not_found:
+            missed = ", ".join(f"#{task_id}" for task_id in not_found)
+            lines.append(f"未找到或已完成：{missed}")
+
+        return "\n".join(lines) if lines else "找不到可完成的任務。"
 
     def _cmd_help(self) -> str:
         return (
             "可用指令：\n"
             "list - 查看全部待辦\n"
             "today - 查看今日任務\n"
-            "done <id> - 完成任務\n"
+            "done <id ...> - 完成一個或多個任務（例：done 3 5 8）\n"
             "\n自然語言例子：下星期二 3pm 同客開會"
         )
 
@@ -204,6 +232,17 @@ class TaskService:
                 lines.append(f"- {reason}")
 
         return "\n".join(lines)
+
+
+def _parse_task_ids(raw_text: str) -> list[int]:
+    ids: list[int] = []
+    for token in re.findall(r"\d+", raw_text):
+        task_id = int(token)
+        if task_id <= 0:
+            continue
+        if task_id not in ids:
+            ids.append(task_id)
+    return ids
 
 
 def _format_due(due_at_iso: str | None, timezone_name: str) -> str:
