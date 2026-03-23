@@ -138,6 +138,15 @@ class TaskService:
         if re.match(r"^/?edit\b", raw, flags=re.IGNORECASE):
             return "請用：edit <id> <新內容>，例如：edit 3 明天 4pm 跟客開會。"
 
+        delete_match = re.match(r"^/?(?:delete|del|remove)\b(.*)$", raw, flags=re.IGNORECASE)
+        if delete_match:
+            task_ids = _parse_task_ids(delete_match.group(1))
+            if not task_ids:
+                return "請提供任務 ID，例如：delete 3 或 delete 3 5 8。"
+            if len(task_ids) > 30:
+                return "一次最多可刪除 30 項任務，請分批執行。"
+            return await self._cmd_delete_many(chat_id, task_ids)
+
         done_match = re.match(r"^/?done\b(.*)$", raw, flags=re.IGNORECASE)
         if done_match:
             task_ids = _parse_task_ids(done_match.group(1))
@@ -217,6 +226,34 @@ class TaskService:
 
         return "\n".join(lines) if lines else "找不到可完成的任務。"
 
+    async def _cmd_delete_many(self, chat_id: str, task_ids: list[int]) -> str:
+        deleted: list[tuple[int, str]] = []
+        not_found: list[int] = []
+
+        for task_no in task_ids:
+            removed = await self.repo.delete_task_by_task_no(chat_id, task_no)
+            if not removed:
+                not_found.append(task_no)
+                continue
+            deleted.append((task_no, str(removed.get("title") or "")))
+
+        if not deleted and len(task_ids) == 1:
+            return f"找不到可刪除的任務 #{task_ids[0]}。"
+
+        lines: list[str] = []
+        if deleted:
+            lines.append(f"已刪除 {len(deleted)} 項任務：")
+            for task_no, title in deleted[:20]:
+                lines.append(f"- #{task_no} {title}")
+            if len(deleted) > 20:
+                lines.append(f"... 另有 {len(deleted) - 20} 項已刪除")
+
+        if not_found:
+            missed = ", ".join(f"#{task_no}" for task_no in not_found)
+            lines.append(f"未找到任務：{missed}")
+
+        return "\n".join(lines) if lines else "找不到可刪除的任務。"
+
     async def _cmd_edit(self, chat_id: str, task_no: int, new_text: str) -> str:
         profile = await self.repo.get_user_profile(chat_id)
         timezone_name = profile.get("timezone") or self.settings.timezone
@@ -257,6 +294,7 @@ class TaskService:
             "list - 查看全部待辦\n"
             "today - 查看今日任務\n"
             "done <id ...> - 完成一個或多個任務（例：done 3 5 8）\n"
+            "delete <id ...> - 刪除任務（例：delete 3 5）\n"
             "edit <id> <新內容> - 更新任務（例：edit 3 明天 4pm 跟客開會）\n"
             "\n自然語言例子：下星期二 3pm 同客開會"
         )

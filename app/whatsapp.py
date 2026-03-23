@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import httpx
@@ -67,12 +68,52 @@ def extract_inbound_messages(payload: dict[str, Any]) -> list[InboundMessage]:
                 if not text:
                     continue
 
+                chat_id = _extract_chat_id(message)
+                sender_id = str(message.get("author") or message.get("from") or "")
+                is_group = _is_group_message(message, chat_id)
+
                 messages.append(
                     InboundMessage(
-                        message_id=message.get("id", ""),
-                        chat_id=message.get("from", ""),
+                        message_id=str(message.get("id", "")),
+                        chat_id=chat_id,
+                        sender_id=sender_id,
+                        is_group=is_group,
                         text=text,
                         raw_payload=message,
                     )
                 )
     return messages
+
+
+def _extract_chat_id(message: dict[str, Any]) -> str:
+    conversation = message.get("conversation")
+    if isinstance(conversation, dict):
+        cid = conversation.get("id")
+        if cid:
+            return str(cid)
+
+    for key in ("group_id", "chat_id"):
+        value = message.get(key)
+        if value:
+            return str(value)
+
+    return str(message.get("from") or "")
+
+
+def _is_group_message(message: dict[str, Any], chat_id: str) -> bool:
+    if str(message.get("recipient_type", "")).lower() == "group":
+        return True
+
+    if message.get("author"):
+        return True
+
+    if message.get("group_id"):
+        return True
+
+    if chat_id.endswith("@g.us"):
+        return True
+
+    if re.fullmatch(r"\d+-\d+", chat_id):
+        return True
+
+    return False

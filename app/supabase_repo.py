@@ -180,6 +180,18 @@ class SupabaseRepo:
         )
         return updated[0] if updated else None
 
+    async def delete_task_by_task_no(self, chat_id: str, task_no: int) -> dict[str, Any] | None:
+        deleted = await self._request(
+            "DELETE",
+            "tasks",
+            params={
+                "chat_id": f"eq.{chat_id}",
+                "task_no": f"eq.{task_no}",
+            },
+            prefer="return=representation",
+        )
+        return deleted[0] if deleted else None
+
     async def list_active_chat_ids(self) -> list[str]:
         tasks = await self._request(
             "GET",

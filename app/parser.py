@@ -109,7 +109,7 @@ def parse_task_text(text: str, timezone_name: str) -> ParsedTask:
         due_local = due_local.replace(tzinfo=local_tz)
 
     if due_local and not _has_explicit_time(matched_fragment or cleaned):
-        due_local = due_local.astimezone(local_tz).replace(hour=17, minute=0, second=0, microsecond=0)
+        due_local = due_local.astimezone(local_tz).replace(hour=12, minute=0, second=0, microsecond=0)
 
     title = _normalize_title(cleaned, matched_fragment)
     if not title and due_local:

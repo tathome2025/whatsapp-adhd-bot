@@ -2,7 +2,7 @@
 
 這是一個可部署在 Vercel 的 WhatsApp 工作任務機器人，支援：
 - 自然語言轉任務（日期、時間、優先度）
-- `list` / `today` / `done <id...>` / `edit <id> <text>` 指令
+- `list` / `today` / `done <id...>` / `delete <id...>` / `edit <id> <text>` 指令
 - 每日推播今日任務
 - 串接 OpenAI API，按 ADHD 友善方式安排順序
 
@@ -85,8 +85,10 @@ Webhook 驗證 URL：
 - `list`: 列出所有待辦
 - `today`: 今日建議順序（會嘗試用 OpenAI 排序）
 - `done 3 5 8`: 一次完成多項任務
+- `delete 3 5`: 一次刪除多項任務
 - `edit 3 明天 4pm 跟客開會`: 修改任務 #3 內容
-- 任務編號 `#id` 以每個電話號碼（chat）獨立重新計數
+- 任務編號 `#id` 以每個聊天範圍（單聊=電話號碼，群組=group chat）獨立重新計數
+- 若有日期但無時間，預設排在 `12:00`
 - 自然語言：`下星期二 3pm 同客開會`
 
 ## 8. 狀態頁（Web UI）

@@ -19,5 +19,7 @@ class ParsedTask:
 class InboundMessage:
     message_id: str
     chat_id: str
+    sender_id: str
+    is_group: bool
     text: str
     raw_payload: dict[str, Any]
