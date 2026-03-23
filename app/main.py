@@ -326,6 +326,8 @@ async def admin_upsert_task_list_member(request: Request, body: AdminTaskListMem
 async def admin_remove_task_list_member(request: Request, list_id: int, chat_id: str) -> dict[str, bool]:
     await _assert_admin_auth(request)
     deleted = await repo.remove_task_list_member(chat_id=chat_id, list_id=int(list_id))
+    if not deleted:
+        raise HTTPException(status_code=400, detail="Cannot remove member (owner membership cannot be removed, or record not found)")
     return {"deleted": deleted}
 
 
@@ -1253,7 +1255,7 @@ def _render_admin_html() -> str:
               <button class="secondary" id="bind-refresh">Refresh</button>
             </div>
             <table>
-              <thead><tr><th>chat_id</th><th>list</th><th>default</th><th>updated_at</th><th></th></tr></thead>
+              <thead><tr><th>chat_id</th><th>list</th><th>role</th><th>default</th><th>updated_at</th><th></th></tr></thead>
               <tbody id="bind-tbody"></tbody>
             </table>
           </div>
@@ -1411,14 +1413,19 @@ def _render_admin_html() -> str:
         for (const item of data.items || []) {{
           const tr = document.createElement("tr");
           const keyPart = item.list_key ? ` key:${{item.list_key}}` : "";
+          const canRemove = (item.role || "").toLowerCase() !== "owner";
+          const removeAction = canRemove
+            ? `<button class="danger" data-del-chat="${{item.chat_id || ""}}" data-del-list="${{item.list_id || ""}}">Remove</button>`
+            : `<span class="muted">Owner</span>`;
           tr.innerHTML = `
             <td>${{item.chat_id || ""}}</td>
             <td>#${{item.list_id || ""}}${{keyPart}} ${{item.list_name || ""}}</td>
+            <td>${{item.role || ""}}</td>
             <td>${{item.is_default ? "yes" : "no"}}</td>
             <td>${{item.updated_at || ""}}</td>
             <td>
               <button class="secondary" data-def-chat="${{item.chat_id || ""}}" data-def-list="${{item.list_id || ""}}">Set Default</button>
-              <button class="danger" data-del-chat="${{item.chat_id || ""}}" data-del-list="${{item.list_id || ""}}">Remove</button>
+              ${{removeAction}}
             </td>
           `;
           tbody.appendChild(tr);
