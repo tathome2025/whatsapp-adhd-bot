@@ -56,12 +56,15 @@ create table if not exists task_list_bindings (
 create table if not exists task_lists (
   id bigserial primary key,
   name text not null default 'Default',
+  list_key text,
   owner_chat_id text not null,
   scope_chat_id text not null unique,
   is_archived boolean not null default false,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+alter table task_lists add column if not exists list_key text;
 
 create table if not exists task_list_members (
   id bigserial primary key,
@@ -92,6 +95,7 @@ create unique index if not exists idx_tasks_chat_task_no on tasks (chat_id, task
 create unique index if not exists idx_tasks_list_task_no on tasks (list_id, task_no) where list_id is not null;
 create index if not exists idx_task_list_bindings_list_chat on task_list_bindings (list_chat_id);
 create index if not exists idx_task_lists_owner on task_lists (owner_chat_id, created_at desc);
+create unique index if not exists idx_task_lists_key_lower on task_lists (lower(list_key)) where list_key is not null and list_key <> '';
 create index if not exists idx_task_list_members_chat on task_list_members (chat_id);
 create index if not exists idx_task_list_members_list on task_list_members (list_id);
 create index if not exists idx_task_list_members_chat_default on task_list_members (chat_id, is_default);
@@ -155,8 +159,8 @@ BEGIN
 END $$;
 
 -- Backfill task_lists and memberships from existing chats
-insert into task_lists (name, owner_chat_id, scope_chat_id)
-select 'Default', x.chat_id, x.chat_id
+insert into task_lists (name, list_key, owner_chat_id, scope_chat_id)
+select 'Default', 'default-' || substr(md5(x.chat_id), 1, 10), x.chat_id, x.chat_id
 from (
   select distinct chat_id from tasks where chat_id is not null and chat_id <> ''
   union
@@ -167,6 +171,11 @@ from (
   select distinct list_chat_id as chat_id from task_list_bindings where list_chat_id is not null and list_chat_id <> ''
 ) x
 on conflict (scope_chat_id) do nothing;
+
+-- Backfill missing list_key
+update task_lists
+set list_key = 'list-' || id::text
+where coalesce(list_key, '') = '';
 
 insert into task_list_members (chat_id, list_id, role, is_default)
 select tl.owner_chat_id, tl.id, 'owner', true

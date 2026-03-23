@@ -58,24 +58,28 @@ class AdminBindingUpsert(BaseModel):
 class AdminTaskListCreateRequest(BaseModel):
     owner_chat_id: str
     name: str
+    list_key: str | None = None
     make_default_for_owner: bool = False
 
 
 class AdminTaskListMemberUpsertRequest(BaseModel):
-    list_id: int
+    list_id: int | None = None
+    list_key: str | None = None
     chat_id: str
     role: str = "member"
     make_default: bool = False
 
 
 class AdminTaskListDefaultRequest(BaseModel):
-    list_id: int
+    list_id: int | None = None
+    list_key: str | None = None
     chat_id: str
 
 
 class AdminBatchAddRequest(BaseModel):
     chat_id: str
     list_id: int | None = None
+    list_key: str | None = None
     lines: list[str] = Field(default_factory=list)
 
 
@@ -87,12 +91,14 @@ class AdminBatchEditItem(BaseModel):
 class AdminBatchEditRequest(BaseModel):
     chat_id: str
     list_id: int | None = None
+    list_key: str | None = None
     items: list[AdminBatchEditItem] = Field(default_factory=list)
 
 
 class AdminBatchDeleteRequest(BaseModel):
     chat_id: str
     list_id: int | None = None
+    list_key: str | None = None
     task_nos: list[int] = Field(default_factory=list)
 
 
@@ -292,6 +298,7 @@ async def admin_create_task_list(request: Request, body: AdminTaskListCreateRequ
         item = await repo.create_task_list(
             owner_chat_id=body.owner_chat_id,
             name=body.name,
+            list_key=body.list_key,
             make_default_for_owner=bool(body.make_default_for_owner),
         )
     except ValueError as exc:
@@ -303,9 +310,10 @@ async def admin_create_task_list(request: Request, body: AdminTaskListCreateRequ
 async def admin_upsert_task_list_member(request: Request, body: AdminTaskListMemberUpsertRequest) -> dict[str, Any]:
     await _assert_admin_auth(request)
     try:
+        target_list_id = await _resolve_admin_target_list_id(body.list_id, body.list_key)
         item = await repo.add_task_list_member(
             chat_id=body.chat_id,
-            list_id=int(body.list_id),
+            list_id=target_list_id,
             role=body.role,
             make_default=bool(body.make_default),
         )
@@ -325,7 +333,8 @@ async def admin_remove_task_list_member(request: Request, list_id: int, chat_id:
 async def admin_set_default_task_list(request: Request, body: AdminTaskListDefaultRequest) -> dict[str, Any]:
     await _assert_admin_auth(request)
     try:
-        item = await repo.set_default_task_list(chat_id=body.chat_id, list_id=int(body.list_id))
+        target_list_id = await _resolve_admin_target_list_id(body.list_id, body.list_key)
+        item = await repo.set_default_task_list(chat_id=body.chat_id, list_id=target_list_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"item": item}
@@ -361,13 +370,14 @@ async def admin_list_tasks(
     chat_id: str,
     status: str = "open",
     list_id: int | None = None,
+    list_key: str | None = None,
 ) -> dict[str, Any]:
     await _assert_admin_auth(request)
     if status not in {"open", "done", "all"}:
         raise HTTPException(status_code=400, detail="status must be open, done, or all")
 
     try:
-        scope = await repo.resolve_task_scope_info(chat_id, list_id=list_id)
+        scope = await repo.resolve_task_scope_info(chat_id, list_id=list_id, list_key=list_key)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -382,6 +392,7 @@ async def admin_list_tasks(
         "scope_chat_id": scope_chat_id,
         "list_id": scope_list_id,
         "list_name": str(scope.get("list_name") or ""),
+        "list_key": str(scope.get("list_key") or ""),
         "timezone": timezone_name,
         "status": status,
         "tasks": [_serialize_task_for_admin(task, timezone_name) for task in tasks],
@@ -398,7 +409,7 @@ async def admin_batch_add_tasks(request: Request, body: AdminBatchAddRequest) ->
         raise HTTPException(status_code=400, detail="At most 100 lines per request")
 
     try:
-        scope = await repo.resolve_task_scope_info(body.chat_id, list_id=body.list_id)
+        scope = await repo.resolve_task_scope_info(body.chat_id, list_id=body.list_id, list_key=body.list_key)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -440,6 +451,7 @@ async def admin_batch_add_tasks(request: Request, body: AdminBatchAddRequest) ->
         "scope_chat_id": scope_chat_id,
         "list_id": scope_list_id,
         "list_name": str(scope.get("list_name") or ""),
+        "list_key": str(scope.get("list_key") or ""),
         "created_count": len(created_items),
         "failed_count": len(failed_items),
         "created_items": created_items,
@@ -456,7 +468,7 @@ async def admin_batch_edit_tasks(request: Request, body: AdminBatchEditRequest) 
         raise HTTPException(status_code=400, detail="At most 100 edits per request")
 
     try:
-        scope = await repo.resolve_task_scope_info(body.chat_id, list_id=body.list_id)
+        scope = await repo.resolve_task_scope_info(body.chat_id, list_id=body.list_id, list_key=body.list_key)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -503,6 +515,7 @@ async def admin_batch_edit_tasks(request: Request, body: AdminBatchEditRequest) 
         "scope_chat_id": scope_chat_id,
         "list_id": scope_list_id,
         "list_name": str(scope.get("list_name") or ""),
+        "list_key": str(scope.get("list_key") or ""),
         "updated_count": len(updated_items),
         "failed_count": len(failed_items),
         "updated_items": updated_items,
@@ -521,7 +534,7 @@ async def admin_batch_delete_tasks(request: Request, body: AdminBatchDeleteReque
         raise HTTPException(status_code=400, detail="At most 200 ids per request")
 
     try:
-        scope = await repo.resolve_task_scope_info(body.chat_id, list_id=body.list_id)
+        scope = await repo.resolve_task_scope_info(body.chat_id, list_id=body.list_id, list_key=body.list_key)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -542,6 +555,7 @@ async def admin_batch_delete_tasks(request: Request, body: AdminBatchDeleteReque
         "scope_chat_id": scope_chat_id,
         "list_id": scope_list_id,
         "list_name": str(scope.get("list_name") or ""),
+        "list_key": str(scope.get("list_key") or ""),
         "deleted_count": len(deleted),
         "not_found_count": len(not_found),
         "deleted": deleted,
@@ -678,6 +692,17 @@ async def _assert_admin_auth(request: Request) -> dict[str, Any]:
     if not user:
         raise HTTPException(status_code=401, detail="Unauthorized admin session")
     return user
+
+
+async def _resolve_admin_target_list_id(list_id: int | None, list_key: str | None) -> int:
+    if list_id is not None:
+        return int(list_id)
+
+    key = (list_key or "").strip()
+    if not key:
+        raise ValueError("Provide list_id or list_key")
+
+    return await repo.resolve_list_id_any(key)
 
 
 async def _get_admin_user_from_request(request: Request) -> dict[str, Any] | None:
@@ -1207,6 +1232,10 @@ def _render_admin_html() -> str:
                 <label for="newlist-name">New List Name</label>
                 <input id="newlist-name" placeholder="Team A / Private / Sales" />
               </div>
+              <div>
+                <label for="newlist-key">List Key (optional)</label>
+                <input id="newlist-key" placeholder="team-a / private / sales_2026" />
+              </div>
               <button id="newlist-create" style="align-self:end;width:120px;">Create</button>
             </div>
             <div class="row">
@@ -1215,8 +1244,8 @@ def _render_admin_html() -> str:
                 <input id="bind-chat" placeholder="85291234567 or group id" />
               </div>
               <div>
-                <label for="bind-list">Target List ID / Owner Chat ID</label>
-                <input id="bind-list" placeholder="#12 或 85290001111" />
+                <label for="bind-list">Target List ID / List Key / Owner Chat ID</label>
+                <input id="bind-list" placeholder="#12 或 personal 或 85290001111" />
               </div>
               <button id="bind-save" style="align-self:end;width:120px;">Add Member</button>
             </div>
@@ -1238,8 +1267,8 @@ def _render_admin_html() -> str:
               <input id="task-chat-id" placeholder="85291234567 or group id" />
             </div>
             <div>
-              <label for="task-list-id">List ID (optional)</label>
-              <input id="task-list-id" placeholder="#12" />
+              <label for="task-list-id">List ID / Key (optional)</label>
+              <input id="task-list-id" placeholder="#12 或 personal" />
             </div>
             <div>
               <label for="task-status">Status</label>
@@ -1381,9 +1410,10 @@ def _render_admin_html() -> str:
         tbody.innerHTML = "";
         for (const item of data.items || []) {{
           const tr = document.createElement("tr");
+          const keyPart = item.list_key ? ` key:${{item.list_key}}` : "";
           tr.innerHTML = `
             <td>${{item.chat_id || ""}}</td>
-            <td>#${{item.list_id || ""}} ${{item.list_name || ""}}</td>
+            <td>#${{item.list_id || ""}}${{keyPart}} ${{item.list_name || ""}}</td>
             <td>${{item.is_default ? "yes" : "no"}}</td>
             <td>${{item.updated_at || ""}}</td>
             <td>
@@ -1426,13 +1456,23 @@ def _render_admin_html() -> str:
         return document.getElementById("task-chat-id").value.trim();
       }}
 
-      function currentTaskListId() {{
+      function currentTaskListSelector() {{
         const raw = document.getElementById("task-list-id").value.trim();
         if (!raw) return null;
-        const clean = raw.startsWith("#") ? raw.slice(1) : raw;
+        return raw;
+      }}
+
+      function splitTaskListSelector(rawSelector) {{
+        const out = {{ list_id: null, list_key: null }};
+        if (!rawSelector) return out;
+        const clean = rawSelector.startsWith("#") ? rawSelector.slice(1) : rawSelector;
         const listId = Number(clean);
-        if (!Number.isFinite(listId) || listId <= 0) return null;
-        return Math.floor(listId);
+        if (Number.isFinite(listId) && listId > 0) {{
+          out.list_id = Math.floor(listId);
+          return out;
+        }}
+        out.list_key = clean;
+        return out;
       }}
 
       async function loadTasks() {{
@@ -1442,8 +1482,10 @@ def _render_admin_html() -> str:
           return;
         }}
         const status = document.getElementById("task-status").value;
-        const listId = currentTaskListId();
-        const listParam = listId ? `&list_id=${{encodeURIComponent(String(listId))}}` : "";
+        const selector = splitTaskListSelector(currentTaskListSelector());
+        const listParam = selector.list_id
+          ? `&list_id=${{encodeURIComponent(String(selector.list_id))}}`
+          : (selector.list_key ? `&list_key=${{encodeURIComponent(selector.list_key)}}` : "");
         const data = await api(`/admin/api/tasks?chat_id=${{encodeURIComponent(chatId)}}&status=${{encodeURIComponent(status)}}${{listParam}}`);
         const tbody = document.getElementById("task-tbody");
         tbody.innerHTML = "";
@@ -1463,6 +1505,7 @@ def _render_admin_html() -> str:
           scope_chat_id: data.scope_chat_id,
           list_id: data.list_id,
           list_name: data.list_name,
+          list_key: data.list_key,
           timezone: data.timezone,
           task_count: (data.tasks || []).length
         }});
@@ -1543,6 +1586,7 @@ def _render_admin_html() -> str:
         try {{
           const owner_chat_id = document.getElementById("newlist-owner").value.trim();
           const name = document.getElementById("newlist-name").value.trim();
+          const list_key = document.getElementById("newlist-key").value.trim();
           if (!owner_chat_id || !name) {{
             alert("請輸入 owner_chat_id 和 list name");
             return;
@@ -1552,6 +1596,7 @@ def _render_admin_html() -> str:
             body: JSON.stringify({{
               owner_chat_id,
               name,
+              list_key: list_key || null,
               make_default_for_owner: false
             }})
           }});
@@ -1568,7 +1613,7 @@ def _render_admin_html() -> str:
       document.getElementById("batch-add-btn").addEventListener("click", async () => {{
         try {{
           const chat_id = currentTaskChatId();
-          const list_id = currentTaskListId();
+          const selector = splitTaskListSelector(currentTaskListSelector());
           if (!chat_id) {{
             alert("請先輸入 Chat ID / Phone");
             return;
@@ -1576,7 +1621,12 @@ def _render_admin_html() -> str:
           const lines = document.getElementById("batch-add-lines").value.split("\\n").map(s => s.trim()).filter(Boolean);
           const data = await api("/admin/api/tasks/batch-add", {{
             method: "POST",
-            body: JSON.stringify({{ chat_id, list_id, lines }})
+            body: JSON.stringify({{
+              chat_id,
+              list_id: selector.list_id,
+              list_key: selector.list_key,
+              lines
+            }})
           }});
           showResult(data);
           await loadTasks();
@@ -1588,7 +1638,7 @@ def _render_admin_html() -> str:
       document.getElementById("batch-edit-btn").addEventListener("click", async () => {{
         try {{
           const chat_id = currentTaskChatId();
-          const list_id = currentTaskListId();
+          const selector = splitTaskListSelector(currentTaskListSelector());
           if (!chat_id) {{
             alert("請先輸入 Chat ID / Phone");
             return;
@@ -1609,7 +1659,12 @@ def _render_admin_html() -> str:
           }}
           const data = await api("/admin/api/tasks/batch-edit", {{
             method: "POST",
-            body: JSON.stringify({{ chat_id, list_id, items }})
+            body: JSON.stringify({{
+              chat_id,
+              list_id: selector.list_id,
+              list_key: selector.list_key,
+              items
+            }})
           }});
           showResult(data);
           await loadTasks();
@@ -1621,7 +1676,7 @@ def _render_admin_html() -> str:
       document.getElementById("batch-delete-btn").addEventListener("click", async () => {{
         try {{
           const chat_id = currentTaskChatId();
-          const list_id = currentTaskListId();
+          const selector = splitTaskListSelector(currentTaskListSelector());
           if (!chat_id) {{
             alert("請先輸入 Chat ID / Phone");
             return;
@@ -1634,7 +1689,12 @@ def _render_admin_html() -> str:
           }}
           const data = await api("/admin/api/tasks/batch-delete", {{
             method: "POST",
-            body: JSON.stringify({{ chat_id, list_id, task_nos }})
+            body: JSON.stringify({{
+              chat_id,
+              list_id: selector.list_id,
+              list_key: selector.list_key,
+              task_nos
+            }})
           }});
           showResult(data);
           await loadTasks();

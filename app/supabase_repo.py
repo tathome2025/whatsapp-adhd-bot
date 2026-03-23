@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import secrets
 import time
+import hashlib
 from datetime import datetime, timezone
 from typing import Any
 
@@ -51,6 +52,30 @@ def _parse_list_id(value: str | int | None) -> int | None:
     if list_id <= 0:
         return None
     return list_id
+
+
+def _normalize_list_key(value: str | None) -> str:
+    raw = (value or "").strip().lower()
+    if not raw:
+        return ""
+
+    key = re.sub(r"[^a-z0-9_-]+", "-", raw)
+    key = re.sub(r"-{2,}", "-", key).strip("-_")
+    return key[:64]
+
+
+def _suffix_list_key(base: str, suffix: str) -> str:
+    clean_base = _normalize_list_key(base) or "list"
+    clean_suffix = _normalize_list_key(suffix) or "x"
+    max_base_len = 64 - len(clean_suffix) - 1
+    if max_base_len <= 0:
+        return clean_suffix[:64]
+    return f"{clean_base[:max_base_len]}-{clean_suffix}"
+
+
+def _default_list_key_for_chat(chat_id: str) -> str:
+    digest = hashlib.sha1(chat_id.encode("utf-8")).hexdigest()[:10]
+    return f"default-{digest}"
 
 
 class SupabaseRepo:
@@ -107,7 +132,7 @@ class SupabaseRepo:
             "GET",
             "task_lists",
             params={
-                "select": "id,name,owner_chat_id,scope_chat_id,is_archived,created_at,updated_at",
+                "select": "id,name,list_key,owner_chat_id,scope_chat_id,is_archived,created_at,updated_at",
                 "id": f"eq.{int(list_id)}",
                 "is_archived": "eq.false",
                 "limit": "1",
@@ -121,13 +146,42 @@ class SupabaseRepo:
             "GET",
             "task_lists",
             params={
-                "select": "id,name,owner_chat_id,scope_chat_id,is_archived,created_at,updated_at",
+                "select": "id,name,list_key,owner_chat_id,scope_chat_id,is_archived,created_at,updated_at",
                 "scope_chat_id": f"eq.{scope}",
                 "is_archived": "eq.false",
                 "limit": "1",
             },
         )
         return rows[0] if rows else None
+
+    async def _get_task_list_by_key(self, list_key: str) -> dict[str, Any] | None:
+        key = _normalize_list_key(list_key)
+        if not key:
+            return None
+
+        rows = await self._request(
+            "GET",
+            "task_lists",
+            params={
+                "select": "id,name,list_key,owner_chat_id,scope_chat_id,is_archived,created_at,updated_at",
+                "list_key": f"eq.{key}",
+                "is_archived": "eq.false",
+                "limit": "1",
+            },
+        )
+        return rows[0] if rows else None
+
+    async def _make_unique_list_key(self, preferred: str) -> str:
+        base = _normalize_list_key(preferred) or "list"
+        candidate = base
+        for idx in range(1, 101):
+            existing = await self._get_task_list_by_key(candidate)
+            if not existing:
+                return candidate
+            candidate = _suffix_list_key(base, str(idx + 1))
+
+        # Fallback should be practically unreachable, but keeps creation robust.
+        return _suffix_list_key(base, f"{int(time.time()):x}")
 
     async def _upsert_membership(
         self,
@@ -215,6 +269,7 @@ class SupabaseRepo:
                 params={"on_conflict": "scope_chat_id"},
                 json_data={
                     "name": "Default",
+                    "list_key": _default_list_key_for_chat(chat_norm),
                     "owner_chat_id": chat_norm,
                     "scope_chat_id": chat_norm,
                 },
@@ -249,7 +304,7 @@ class SupabaseRepo:
             "GET",
             "task_lists",
             params={
-                "select": "id,name,owner_chat_id,scope_chat_id,is_archived,created_at,updated_at",
+                "select": "id,name,list_key,owner_chat_id,scope_chat_id,is_archived,created_at,updated_at",
                 "id": f"in.({id_filter})",
                 "is_archived": "eq.false",
                 "limit": str(max(200, len(list_ids))),
@@ -267,6 +322,7 @@ class SupabaseRepo:
                 {
                     "list_id": list_id,
                     "list_name": str(list_row.get("name") or ""),
+                    "list_key": str(list_row.get("list_key") or ""),
                     "scope_chat_id": str(list_row.get("scope_chat_id") or ""),
                     "owner_chat_id": str(list_row.get("owner_chat_id") or ""),
                     "is_default": bool(member.get("is_default")),
@@ -279,12 +335,18 @@ class SupabaseRepo:
         out.sort(key=lambda row: (not bool(row["is_default"]), row["list_id"]))
         return out
 
-    async def resolve_task_scope_info(self, chat_id: str, list_id: int | None = None) -> dict[str, Any]:
+    async def resolve_task_scope_info(
+        self,
+        chat_id: str,
+        list_id: int | None = None,
+        *,
+        list_key: str | None = None,
+    ) -> dict[str, Any]:
         chat_norm = _normalize_chat_id(chat_id)
         if not chat_norm:
             raise ValueError("Invalid chat id")
 
-        if list_id is None:
+        if list_id is None and not list_key:
             memberships = await self.list_task_lists_for_chat(chat_norm)
             if not memberships:
                 default_list = await self._ensure_default_task_list(chat_norm)
@@ -292,6 +354,7 @@ class SupabaseRepo:
                     "chat_id": chat_norm,
                     "list_id": int(default_list["id"]),
                     "list_name": str(default_list.get("name") or "Default"),
+                    "list_key": str(default_list.get("list_key") or ""),
                     "scope_chat_id": str(default_list.get("scope_chat_id") or chat_norm),
                     "owner_chat_id": str(default_list.get("owner_chat_id") or chat_norm),
                     "is_default": True,
@@ -302,9 +365,13 @@ class SupabaseRepo:
                 **memberships[0],
             }
 
-        list_id_int = int(list_id)
         memberships = await self.list_task_lists_for_chat(chat_norm)
-        found = next((row for row in memberships if int(row["list_id"]) == list_id_int), None)
+        if list_id is not None:
+            list_id_int = int(list_id)
+            found = next((row for row in memberships if int(row["list_id"]) == list_id_int), None)
+        else:
+            target_key = _normalize_list_key(list_key)
+            found = next((row for row in memberships if _normalize_list_key(str(row.get("list_key") or "")) == target_key), None)
         if not found:
             raise ValueError("List not found for this chat")
 
@@ -312,6 +379,63 @@ class SupabaseRepo:
             "chat_id": chat_norm,
             **found,
         }
+
+    async def resolve_task_list_for_chat(self, chat_id: str, selector: str | int) -> dict[str, Any]:
+        memberships = await self.list_task_lists_for_chat(chat_id)
+        if not memberships:
+            raise ValueError("List not found for this chat")
+
+        token = str(selector).strip()
+        if token.startswith("#"):
+            token = token[1:]
+
+        by_id = _parse_list_id(token)
+        if by_id is not None:
+            matched = next((row for row in memberships if int(row["list_id"]) == by_id), None)
+            if matched:
+                return matched
+
+        token_key = _normalize_list_key(token)
+        if token_key:
+            matched = next(
+                (
+                    row
+                    for row in memberships
+                    if _normalize_list_key(str(row.get("list_key") or "")) == token_key
+                ),
+                None,
+            )
+            if matched:
+                return matched
+
+        token_lower = token.lower()
+        if token_lower:
+            matched = next((row for row in memberships if str(row.get("list_name", "")).lower() == token_lower), None)
+            if matched:
+                return matched
+            matched = next((row for row in memberships if token_lower in str(row.get("list_name", "")).lower()), None)
+            if matched:
+                return matched
+
+        raise ValueError("List not found for this chat")
+
+    async def resolve_list_id_any(self, selector: str | int) -> int:
+        token = str(selector).strip()
+        if token.startswith("#"):
+            token = token[1:]
+
+        list_id = _parse_list_id(token)
+        if list_id is not None:
+            row = await self._get_task_list_by_id(list_id)
+            if not row:
+                raise ValueError("List not found")
+            return int(row["id"])
+
+        row = await self._get_task_list_by_key(token)
+        if row:
+            return int(row["id"])
+
+        raise ValueError("List not found")
 
     async def resolve_task_scope(self, chat_id: str) -> str:
         info = await self.resolve_task_scope_info(chat_id)
@@ -335,6 +459,7 @@ class SupabaseRepo:
         owner_chat_id: str,
         name: str,
         *,
+        list_key: str | None = None,
         make_default_for_owner: bool = False,
     ) -> dict[str, Any]:
         owner = _normalize_chat_id(owner_chat_id)
@@ -343,12 +468,22 @@ class SupabaseRepo:
 
         clean_name = (name or "").strip() or "New List"
         scope_chat_id = self._make_list_scope_chat_id(owner)
+        preferred_key = _normalize_list_key(list_key)
+        if list_key is not None:
+            if not preferred_key:
+                raise ValueError("Invalid list key")
+            if await self._get_task_list_by_key(preferred_key):
+                raise ValueError("list_key already exists")
+            assigned_key = preferred_key
+        else:
+            assigned_key = await self._make_unique_list_key(clean_name)
 
         rows = await self._request(
             "POST",
             "task_lists",
             json_data={
                 "name": clean_name,
+                "list_key": assigned_key,
                 "owner_chat_id": owner,
                 "scope_chat_id": scope_chat_id,
             },
@@ -367,6 +502,7 @@ class SupabaseRepo:
         return {
             "list_id": list_id,
             "list_name": str(created.get("name") or clean_name),
+            "list_key": str(created.get("list_key") or assigned_key),
             "scope_chat_id": str(created.get("scope_chat_id") or scope_chat_id),
             "owner_chat_id": str(created.get("owner_chat_id") or owner),
             "is_default": bool(first_list or make_default_for_owner),
@@ -451,7 +587,7 @@ class SupabaseRepo:
             "GET",
             "task_lists",
             params={
-                "select": "id,name,owner_chat_id,scope_chat_id,updated_at",
+                "select": "id,name,list_key,owner_chat_id,scope_chat_id,updated_at",
                 "id": f"in.({id_filter})",
                 "limit": str(max(200, len(list_ids))),
             },
@@ -469,6 +605,7 @@ class SupabaseRepo:
                     "chat_id": str(member.get("chat_id") or ""),
                     "list_id": list_id,
                     "list_name": str(list_row.get("name") or ""),
+                    "list_key": str(list_row.get("list_key") or ""),
                     "list_chat_id": str(list_row.get("scope_chat_id") or ""),
                     "owner_chat_id": str(list_row.get("owner_chat_id") or ""),
                     "role": str(member.get("role") or "member"),
@@ -487,8 +624,12 @@ class SupabaseRepo:
 
         target_list_id = _parse_list_id(list_chat_id)
         if target_list_id is None:
-            owner_scope = await self.resolve_task_scope_info(list_chat_id)
-            target_list_id = int(owner_scope["list_id"])
+            target_list = await self._get_task_list_by_key(list_chat_id)
+            if target_list is not None:
+                target_list_id = int(target_list["id"])
+            else:
+                owner_scope = await self.resolve_task_scope_info(list_chat_id)
+                target_list_id = int(owner_scope["list_id"])
 
         info = await self.add_task_list_member(chat_norm, target_list_id, role="member", make_default=True)
         return {
@@ -496,6 +637,7 @@ class SupabaseRepo:
             "list_chat_id": str(info["scope_chat_id"]),
             "list_id": int(info["list_id"]),
             "list_name": str(info.get("list_name") or ""),
+            "list_key": str(info.get("list_key") or ""),
             "is_default": bool(info.get("is_default")),
         }
 

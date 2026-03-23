@@ -80,7 +80,7 @@ class TaskService:
 
         lines = [
             f"已加入任務 #{display_no}",
-            f"清單：{scope.get('list_name', '')} (#{scope['list_id']})",
+            f"清單：{_format_list_ref(scope)}",
             f"內容：{created['title']}",
             f"時間：{due_label}",
             f"優先度：{priority_label}",
@@ -137,6 +137,7 @@ class TaskService:
                 ai_sorted=not bool(plan.get("fallback", False)),
                 list_name=str(scope.get("list_name") or ""),
                 list_id=int(scope["list_id"]),
+                list_key=str(scope.get("list_key") or ""),
             )
             await self.whatsapp_client.send_text_message(recipient_chat_id, message)
 
@@ -174,11 +175,11 @@ class TaskService:
         if use_match:
             return await self._cmd_use(chat_id, use_match.group(1).strip())
 
-        share_match = re.match(r"^/?share\s+(#?\d+)\s+(\S+)$", raw, flags=re.IGNORECASE)
+        share_match = re.match(r"^/?share\s+(\S+)\s+(\S+)$", raw, flags=re.IGNORECASE)
         if share_match:
             return await self._cmd_share(chat_id, share_match.group(1), share_match.group(2))
 
-        unshare_match = re.match(r"^/?unshare\s+(#?\d+)\s+(\S+)$", raw, flags=re.IGNORECASE)
+        unshare_match = re.match(r"^/?unshare\s+(\S+)\s+(\S+)$", raw, flags=re.IGNORECASE)
         if unshare_match:
             return await self._cmd_unshare(chat_id, unshare_match.group(1), unshare_match.group(2))
 
@@ -226,64 +227,54 @@ class TaskService:
         for item in lists[:30]:
             marker = "*" if bool(item.get("is_default")) else " "
             role = str(item.get("role") or "member")
-            lines.append(f"{marker} #{item['list_id']} [{role}] {item.get('list_name','')} ")
+            key = str(item.get("list_key") or "")
+            key_label = f" key:{key}" if key else ""
+            lines.append(f"{marker} #{item['list_id']}{key_label} [{role}] {item.get('list_name','')} ")
 
-        lines.append("\n用法：use <list_id> 切換預設清單")
+        lines.append("\n用法：use <list_id或list_key> 切換預設清單")
         return "\n".join(lines)
 
     async def _cmd_newlist(self, chat_id: str, name: str) -> str:
         created = await self.repo.create_task_list(chat_id, name, make_default_for_owner=True)
+        key = str(created.get("list_key") or "")
+        key_line = f"識別：{key}\n" if key else ""
         return (
             f"已建立清單 #{created['list_id']}\n"
+            f"{key_line}"
             f"名稱：{created.get('list_name','')}\n"
             "已設為目前預設清單。"
         )
 
     async def _cmd_use(self, chat_id: str, target: str) -> str:
-        lists = await self.repo.list_task_lists_for_chat(chat_id)
-        if not lists:
-            return "你目前沒有可切換的清單。"
-
-        chosen: dict[str, Any] | None = None
-        target_clean = target.strip()
-        if target_clean.startswith("#"):
-            target_clean = target_clean[1:]
-
-        if target_clean.isdigit():
-            wanted = int(target_clean)
-            chosen = next((item for item in lists if int(item["list_id"]) == wanted), None)
-        else:
-            lower = target.lower()
-            chosen = next((item for item in lists if str(item.get("list_name", "")).lower() == lower), None)
-            if chosen is None:
-                chosen = next((item for item in lists if lower in str(item.get("list_name", "")).lower()), None)
-
-        if not chosen:
+        try:
+            chosen = await self.repo.resolve_task_list_for_chat(chat_id, target)
+        except ValueError:
             return "找不到該清單，請先用 lists 查看可用清單。"
 
         applied = await self.repo.set_default_task_list(chat_id, int(chosen["list_id"]))
-        return f"已切換至清單 #{applied['list_id']}：{applied.get('list_name','')}"
+        return f"已切換至清單 {_format_list_ref(applied)}"
 
     async def _cmd_share(self, chat_id: str, list_token: str, member_chat_id: str) -> str:
-        list_id = _parse_single_list_id(list_token)
-        if list_id is None:
-            return "請提供有效 list_id，例如：share 12 85291234567"
+        try:
+            chosen = await self.repo.resolve_task_list_for_chat(chat_id, list_token)
+        except ValueError:
+            return "請提供有效清單，例如：share 12 85291234567 或 share personal 85291234567"
 
-        info = await self.repo.resolve_task_scope_info(chat_id, list_id)
-        _ = info
+        list_id = int(chosen["list_id"])
         await self.repo.add_task_list_member(member_chat_id, list_id, role="member", make_default=False)
-        return f"已分享清單 #{list_id} 給 {member_chat_id}。"
+        return f"已分享清單 {_format_list_ref(chosen)} 給 {member_chat_id}。"
 
     async def _cmd_unshare(self, chat_id: str, list_token: str, member_chat_id: str) -> str:
-        list_id = _parse_single_list_id(list_token)
-        if list_id is None:
-            return "請提供有效 list_id，例如：unshare 12 85291234567"
+        try:
+            chosen = await self.repo.resolve_task_list_for_chat(chat_id, list_token)
+        except ValueError:
+            return "請提供有效清單，例如：unshare 12 85291234567 或 unshare personal 85291234567"
 
-        _ = await self.repo.resolve_task_scope_info(chat_id, list_id)
+        list_id = int(chosen["list_id"])
         removed = await self.repo.remove_task_list_member(member_chat_id, list_id)
         if not removed:
-            return f"未找到 {member_chat_id} 在清單 #{list_id} 的分享紀錄。"
-        return f"已取消清單 #{list_id} 對 {member_chat_id} 的分享。"
+            return f"未找到 {member_chat_id} 在清單 {_format_list_ref(chosen)} 的分享紀錄。"
+        return f"已取消清單 {_format_list_ref(chosen)} 對 {member_chat_id} 的分享。"
 
     async def _cmd_list(self, chat_id: str, scope: dict[str, Any]) -> str:
         profile = await self.repo.get_user_profile(chat_id)
@@ -294,9 +285,9 @@ class TaskService:
             list_id=int(scope["list_id"]),
         )
         if not tasks:
-            return f"清單 #{scope['list_id']}（{scope.get('list_name','')}）目前沒有待辦任務。"
+            return f"清單 {_format_list_ref(scope)} 目前沒有待辦任務。"
 
-        lines = [f"待辦清單 #{scope['list_id']}（{scope.get('list_name','')}）："]
+        lines = [f"待辦清單 {_format_list_ref(scope)}："]
         for task in tasks[:30]:
             due_label = _format_due(task.get("due_at"), timezone_name)
             priority = PRIORITY_LABELS.get(int(task.get("priority", 2)), "中")
@@ -317,7 +308,7 @@ class TaskService:
             list_id=int(scope["list_id"]),
         )
         if not today_tasks:
-            return f"清單 #{scope['list_id']}（{scope.get('list_name','')}）今天沒有排程任務。"
+            return f"清單 {_format_list_ref(scope)} 今天沒有排程任務。"
 
         plan = await self.planner.rank_tasks_for_adhd(
             f"list:{scope['list_id']}:chat:{chat_id}",
@@ -335,6 +326,7 @@ class TaskService:
             ai_sorted=not bool(plan.get("fallback", False)),
             list_name=str(scope.get("list_name") or ""),
             list_id=int(scope["list_id"]),
+            list_key=str(scope.get("list_key") or ""),
         )
 
     async def _cmd_done_many(self, scope: dict[str, Any], task_ids: list[int]) -> str:
@@ -440,7 +432,7 @@ class TaskService:
         priority_label = PRIORITY_LABELS.get(int(updated.get("priority", 2)), "中")
         return (
             f"已更新任務 #{_task_no(updated)}\n"
-            f"清單：{scope.get('list_name','')} (#{scope['list_id']})\n"
+            f"清單：{_format_list_ref(scope)}\n"
             f"內容：{updated['title']}\n"
             f"時間：{due_label}\n"
             f"優先度：{priority_label}"
@@ -453,9 +445,9 @@ class TaskService:
             "today - 查看目前清單今日任務\n"
             "lists - 查看你可用的所有清單\n"
             "newlist <名稱> - 建立新清單並切換\n"
-            "use <list_id或名稱> - 切換目前清單\n"
-            "share <list_id> <電話> - 分享清單給其他號碼\n"
-            "unshare <list_id> <電話> - 取消分享\n"
+            "use <list_id/list_key/名稱> - 切換目前清單\n"
+            "share <list_id或list_key> <電話> - 分享清單給其他號碼\n"
+            "unshare <list_id或list_key> <電話> - 取消分享\n"
             "done <id ...> - 完成一個或多個任務（例：done 3 5 8）\n"
             "delete <id ...> - 刪除任務（例：delete 3 5）\n"
             "edit <id> <新內容> - 更新任務（例：edit 3 明天 4pm 跟客開會）\n"
@@ -532,9 +524,11 @@ class TaskService:
         ai_sorted: bool,
         list_name: str,
         list_id: int,
+        list_key: str = "",
     ) -> str:
         title = "今日工作清單" if push_mode else "今天建議執行順序"
-        lines = [f"{title}：", f"清單：{list_name} (#{list_id})"]
+        key_part = f", key:{list_key}" if list_key else ""
+        lines = [f"{title}：", f"清單：{list_name} (#{list_id}{key_part})"]
         if ai_sorted:
             lines.append("（由AI排序）")
 
@@ -562,16 +556,12 @@ def _parse_task_ids(raw_text: str) -> list[int]:
     return ids
 
 
-def _parse_single_list_id(raw: str) -> int | None:
-    value = raw.strip()
-    if value.startswith("#"):
-        value = value[1:]
-    if not value.isdigit():
-        return None
-    list_id = int(value)
-    if list_id <= 0:
-        return None
-    return list_id
+def _format_list_ref(scope: dict[str, Any]) -> str:
+    list_name = str(scope.get("list_name") or "")
+    list_id = int(scope.get("list_id") or 0)
+    list_key = str(scope.get("list_key") or "")
+    key_part = f", key:{list_key}" if list_key else ""
+    return f"{list_name} (#{list_id}{key_part})"
 
 
 def _task_no(task: dict[str, Any]) -> int:
