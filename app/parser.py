@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import dateparser
@@ -27,6 +27,29 @@ TIME_PATTERN = re.compile(
 EFFORT_PATTERN = re.compile(
     r"(?ix)(\\d{1,3})\\s*(分鐘|分|mins?|minutes?|hr|hrs|hours?|小時|小时)"
 )
+RELATIVE_WEEKDAY_PATTERN = re.compile(
+    r"(?P<full>(?P<prefix>下下|下|今|這|这|呢|本)?\\s*(?:個|个)?\\s*(?:星期|週|周|禮拜|礼拜)\\s*(?P<weekday>[一二三四五六日天]))"
+)
+WEEKDAY_MAP = {
+    "一": 0,
+    "二": 1,
+    "三": 2,
+    "四": 3,
+    "五": 4,
+    "六": 5,
+    "日": 6,
+    "天": 6,
+}
+WEEK_OFFSET_MAP = {
+    "下下": 2,
+    "下": 1,
+    "今": 0,
+    "這": 0,
+    "这": 0,
+    "呢": 0,
+    "本": 0,
+    "": 0,
+}
 
 
 def _has_explicit_time(text: str) -> bool:
@@ -62,13 +85,84 @@ def _extract_effort_minutes(text: str) -> int | None:
     return value
 
 
-def _normalize_title(raw_text: str, date_fragment: str | None) -> str:
+def _normalize_title(raw_text: str, fragments: list[str] | None) -> str:
     title = raw_text
-    if date_fragment:
-        title = title.replace(date_fragment, " ", 1)
+    for fragment in fragments or []:
+        clean = (fragment or "").strip()
+        if clean:
+            title = title.replace(clean, " ", 1)
 
     title = re.sub(r"\\s+", " ", title).strip(" ,，。.!！？")
     return title
+
+
+def _compute_relative_weekday_due(
+    match: re.Match[str],
+    now_local: datetime,
+    timezone_name: str,
+    source_text: str,
+) -> tuple[datetime, list[str]] | None:
+    weekday_raw = (match.group("weekday") or "").strip()
+    target_weekday = WEEKDAY_MAP.get(weekday_raw)
+    if target_weekday is None:
+        return None
+
+    prefix_raw = (match.group("prefix") or "").strip()
+    week_offset = WEEK_OFFSET_MAP.get(prefix_raw, 0)
+
+    today = now_local.date()
+    this_week_start = today - timedelta(days=today.weekday())
+    target_date = this_week_start + timedelta(days=target_weekday + (7 * week_offset))
+
+    # Keep future preference for phrases without an explicit "next week" offset.
+    if week_offset == 0 and target_date <= today:
+        target_date = target_date + timedelta(days=7)
+
+    local_tz = ZoneInfo(timezone_name)
+    due_local = datetime(
+        year=target_date.year,
+        month=target_date.month,
+        day=target_date.day,
+        hour=12,
+        minute=0,
+        second=0,
+        microsecond=0,
+        tzinfo=local_tz,
+    )
+
+    date_fragment = (match.group("full") or "").strip()
+    fragments = [date_fragment] if date_fragment else []
+
+    remainder = source_text.replace(date_fragment, " ", 1)
+    parser_settings = {
+        "PREFER_DATES_FROM": "future",
+        "TIMEZONE": timezone_name,
+        "RETURN_AS_TIMEZONE_AWARE": True,
+        "RELATIVE_BASE": due_local,
+    }
+    time_matches = search_dates(remainder, languages=["zh", "en"], settings=parser_settings) or []
+    time_fragment = None
+    time_value = None
+    for fragment, parsed in time_matches:
+        if _has_explicit_time(fragment):
+            time_fragment = fragment
+            time_value = parsed
+            break
+
+    if time_value:
+        if time_value.tzinfo is None:
+            time_value = time_value.replace(tzinfo=local_tz)
+        time_local = time_value.astimezone(local_tz)
+        due_local = due_local.replace(
+            hour=time_local.hour,
+            minute=time_local.minute,
+            second=0,
+            microsecond=0,
+        )
+        if time_fragment:
+            fragments.append(time_fragment)
+
+    return due_local, fragments
 
 
 def parse_task_text(text: str, timezone_name: str) -> ParsedTask:
@@ -94,24 +188,34 @@ def parse_task_text(text: str, timezone_name: str) -> ParsedTask:
     }
 
     due_local = None
-    matched_fragment = None
+    matched_fragments: list[str] = []
 
-    matches = search_dates(cleaned, languages=["zh", "en"], settings=parser_settings)
-    if matches:
-        matched_fragment, due_local = matches[0]
-    else:
-        parsed = dateparser.parse(cleaned, languages=["zh", "en"], settings=parser_settings)
-        if parsed:
-            due_local = parsed
-            matched_fragment = cleaned
+    relative_match = RELATIVE_WEEKDAY_PATTERN.search(cleaned)
+    if relative_match:
+        relative_due = _compute_relative_weekday_due(relative_match, now_local, timezone_name, cleaned)
+        if relative_due:
+            due_local, matched_fragments = relative_due
+
+    if due_local is None:
+        matches = search_dates(cleaned, languages=["zh", "en"], settings=parser_settings)
+        if matches:
+            matched_fragment, due_local = matches[0]
+            if matched_fragment:
+                matched_fragments = [matched_fragment]
+        else:
+            parsed = dateparser.parse(cleaned, languages=["zh", "en"], settings=parser_settings)
+            if parsed:
+                due_local = parsed
+                matched_fragments = [cleaned]
 
     if due_local and due_local.tzinfo is None:
         due_local = due_local.replace(tzinfo=local_tz)
 
-    if due_local and not _has_explicit_time(matched_fragment or cleaned):
+    merged_fragment = " ".join(matched_fragments).strip()
+    if due_local and not _has_explicit_time(merged_fragment or cleaned):
         due_local = due_local.astimezone(local_tz).replace(hour=12, minute=0, second=0, microsecond=0)
 
-    title = _normalize_title(cleaned, matched_fragment)
+    title = _normalize_title(cleaned, matched_fragments)
     if not title and due_local:
         title = "未命名任務"
 

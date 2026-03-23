@@ -5,6 +5,7 @@ def test_parse_with_due_time_and_title() -> None:
     parsed = parse_task_text("下星期二 3pm 同客開會", "Asia/Hong_Kong")
     assert parsed.title
     assert parsed.due_at_utc is not None
+    assert parsed.title == "同客開會"
 
 
 def test_parse_without_date() -> None:
@@ -16,3 +17,9 @@ def test_parse_without_date() -> None:
 def test_priority_keywords() -> None:
     parsed = parse_task_text("緊急 明天 9am 交 proposal", "Asia/Hong_Kong")
     assert parsed.priority == 3
+
+
+def test_parse_relative_weekday_without_time() -> None:
+    parsed = parse_task_text("下禮拜二 同客開會", "Asia/Hong_Kong")
+    assert parsed.due_at_utc is not None
+    assert parsed.title == "同客開會"
