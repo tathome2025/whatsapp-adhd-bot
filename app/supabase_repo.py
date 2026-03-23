@@ -520,8 +520,10 @@ class SupabaseRepo:
     ) -> dict[str, Any]:
         chat_norm = _normalize_chat_id(chat_id)
         list_row = await self._get_task_list_by_id(int(list_id))
-        if not chat_norm or not list_row:
-            raise ValueError("Invalid chat or list")
+        if not chat_norm:
+            raise ValueError("Invalid member chat id")
+        if not list_row:
+            raise ValueError(f"List not found: {int(list_id)}")
 
         clean_role = role if role in {"owner", "member"} else "member"
         await self._upsert_membership(chat_norm, int(list_id), role=clean_role, is_default=make_default)
@@ -622,14 +624,24 @@ class SupabaseRepo:
         if not chat_norm:
             raise ValueError("Invalid chat id")
 
-        target_list_id = _parse_list_id(list_chat_id)
+        list_token = (list_chat_id or "").strip()
+        if not list_token:
+            raise ValueError("Target list is required")
+
+        if list_token.lower().startswith("key:"):
+            list_token = list_token[4:].strip()
+
+        target_list_id = _parse_list_id(list_token)
         if target_list_id is None:
-            target_list = await self._get_task_list_by_key(list_chat_id)
+            target_list = await self._get_task_list_by_key(list_token)
             if target_list is not None:
                 target_list_id = int(target_list["id"])
-            else:
-                owner_scope = await self.resolve_task_scope_info(list_chat_id)
-                target_list_id = int(owner_scope["list_id"])
+        if target_list_id is None:
+            try:
+                owner_scope = await self.resolve_task_scope_info(list_token)
+            except ValueError as exc:
+                raise ValueError("Target list not found. Use list_id, list_key, or owner chat id.") from exc
+            target_list_id = int(owner_scope["list_id"])
 
         info = await self.add_task_list_member(chat_norm, target_list_id, role="member", make_default=True)
         return {
