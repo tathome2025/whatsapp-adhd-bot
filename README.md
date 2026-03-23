@@ -27,7 +27,7 @@ vercel.json                # Vercel routes + cron
 
 1. 在 Supabase Dashboard 建立專案
 2. 打開 SQL Editor，貼上 [`supabase/schema.sql`](supabase/schema.sql)
-   (如你已有舊資料庫，請重新執行一次作 migration，會加入 `task_no` 與 `edit` 需要欄位)
+   (如你已有舊資料庫，請重新執行一次作 migration，會加入 `task_no`、`whitelist_contacts`、`task_list_bindings`、`admin_users` 等欄位/資料表)
 3. 執行後取得：
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
@@ -49,7 +49,8 @@ TIMEZONE=Asia/Hong_Kong
 DAILY_PUSH_TIME=09:00
 MAX_DAILY_TASKS=6
 CRON_SECRET=
-ADMIN_TOKEN=
+ADMIN_SESSION_SECRET=
+ADMIN_SESSION_HOURS=12
 ```
 
 ## 4. 本地啟動
@@ -106,7 +107,8 @@ Webhook 驗證 URL：
 ## 9. 管理頁（Web UI）
 
 - `GET /admin`: 管理主控台（黑 / 白 / 灰 / 橙主調）
-- API 需要 `X-Admin-Token: <ADMIN_TOKEN>`（或 `Authorization: Bearer <ADMIN_TOKEN>`）
+- 使用 login system（email/password）
+- 成功登入後會寫入 HttpOnly cookie session（無需手動 token）
 
 功能：
 - 白名單：新增 / 修改 / 刪除可回應 bot 的電話號碼
@@ -119,6 +121,33 @@ Webhook 驗證 URL：
 備註：
 - bot 收到訊息時先檢查 `sender_id` 是否在白名單，不在則忽略
 - 任務編號 `task_no` 會以每個 task list（`chat_id`）獨立重新計數
+
+### 建立 admin 用戶（Supabase 手動）
+
+`supabase/schema.sql` 會建立 `admin_users` 表。請先在本機產生密碼 hash：
+
+```bash
+python3 - <<'PY'
+from app.admin_auth import hash_password
+print(hash_password("YOUR_STRONG_PASSWORD"))
+PY
+```
+
+然後在 Supabase SQL Editor 執行：
+
+```sql
+insert into admin_users (email, display_name, password_hash, status)
+values (
+  'admin@example.com',
+  'Admin',
+  '貼上上面產生的 hash',
+  'active'
+)
+on conflict (email) do update
+set password_hash = excluded.password_hash,
+    status = 'active',
+    updated_at = now();
+```
 
 ## 10. 法務頁（Meta 用）
 

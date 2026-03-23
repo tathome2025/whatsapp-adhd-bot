@@ -50,11 +50,23 @@ create table if not exists task_list_bindings (
   updated_at timestamptz not null default now()
 );
 
+create table if not exists admin_users (
+  id bigserial primary key,
+  email text not null unique,
+  display_name text,
+  password_hash text not null,
+  status text not null default 'active' check (status in ('active', 'disabled')),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  last_login_at timestamptz
+);
+
 create index if not exists idx_tasks_chat_status_due on tasks (chat_id, status, due_at);
 create index if not exists idx_tasks_chat_created on tasks (chat_id, created_at desc);
 create index if not exists idx_daily_plans_chat_date on daily_plans (chat_id, plan_date desc);
 create unique index if not exists idx_tasks_chat_task_no on tasks (chat_id, task_no);
 create index if not exists idx_task_list_bindings_list_chat on task_list_bindings (list_chat_id);
+create unique index if not exists idx_admin_users_email_lower on admin_users (lower(email));
 
 create or replace function set_updated_at()
 returns trigger as $$
@@ -109,4 +121,9 @@ for each row execute procedure assign_task_no();
 drop trigger if exists trg_task_list_bindings_updated_at on task_list_bindings;
 create trigger trg_task_list_bindings_updated_at
 before update on task_list_bindings
+for each row execute procedure set_updated_at();
+
+drop trigger if exists trg_admin_users_updated_at on admin_users;
+create trigger trg_admin_users_updated_at
+before update on admin_users
 for each row execute procedure set_updated_at();

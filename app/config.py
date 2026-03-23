@@ -22,7 +22,8 @@ class Settings(BaseSettings):
     daily_push_time: str = "09:00"
     max_daily_tasks: int = 6
     cron_secret: str = ""
-    admin_token: str = ""
+    admin_session_secret: str = ""
+    admin_session_hours: int = 12
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
@@ -32,6 +33,13 @@ class Settings(BaseSettings):
         if value in (None, ""):
             return 6
         return int(value)
+
+    @field_validator("admin_session_hours", mode="before")
+    @classmethod
+    def normalize_admin_session_hours(cls, value: object) -> int:
+        if value in (None, ""):
+            return 12
+        return max(int(value), 1)
 
     @property
     def supabase_rest_url(self) -> str:

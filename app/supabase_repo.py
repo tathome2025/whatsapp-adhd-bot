@@ -417,6 +417,63 @@ class SupabaseRepo:
         )
         return bool(deleted)
 
+    async def get_admin_user_by_email(self, email: str) -> dict[str, Any] | None:
+        normalized = (email or "").strip().lower()
+        if not normalized:
+            return None
+
+        rows = await self._request(
+            "GET",
+            "admin_users",
+            params={
+                "select": "id,email,display_name,password_hash,status",
+                "email": f"eq.{normalized}",
+                "status": "eq.active",
+                "limit": "1",
+            },
+        )
+        return rows[0] if rows else None
+
+    async def get_admin_user_by_id(self, user_id: int) -> dict[str, Any] | None:
+        rows = await self._request(
+            "GET",
+            "admin_users",
+            params={
+                "select": "id,email,display_name,status",
+                "id": f"eq.{int(user_id)}",
+                "status": "eq.active",
+                "limit": "1",
+            },
+        )
+        return rows[0] if rows else None
+
+    async def touch_admin_login(self, user_id: int) -> None:
+        await self._request(
+            "PATCH",
+            "admin_users",
+            params={
+                "id": f"eq.{int(user_id)}",
+            },
+            json_data={
+                "last_login_at": datetime.now(timezone.utc).isoformat(),
+            },
+            prefer="return=minimal",
+        )
+
+    async def admin_user_store_health_check(self) -> dict[str, Any]:
+        try:
+            await self._request(
+                "GET",
+                "admin_users",
+                params={
+                    "select": "id",
+                    "limit": "1",
+                },
+            )
+            return {"ok": True}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+
     async def health_check(self) -> dict[str, Any]:
         if not self.settings.supabase_url or not self.settings.supabase_service_role_key:
             return {

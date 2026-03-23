@@ -10,10 +10,11 @@ from html import escape
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
+from app.admin_auth import make_session_token, parse_session_token, verify_password
 from app.config import get_settings
 from app.openai_planner import OpenAIPlanner
 from app.parser import parse_task_text
@@ -40,6 +41,8 @@ WEBHOOK_RUNTIME: dict[str, object] = {
     "last_processed": 0,
     "last_ignored": 0,
 }
+
+ADMIN_COOKIE_NAME = "wa_admin_session"
 
 
 class AdminWhitelistUpsert(BaseModel):
@@ -70,6 +73,11 @@ class AdminBatchEditRequest(BaseModel):
 class AdminBatchDeleteRequest(BaseModel):
     chat_id: str
     task_nos: list[int] = Field(default_factory=list)
+
+
+class AdminLoginRequest(BaseModel):
+    email: str
+    password: str
 
 
 @app.get("/healthz")
@@ -159,16 +167,79 @@ async def admin_page() -> str:
     return _render_admin_html()
 
 
+@app.get("/admin/auth/me")
+async def admin_me(request: Request) -> dict[str, Any]:
+    user = await _get_admin_user_from_request(request)
+    if not user:
+        return {"authenticated": False}
+    return {
+        "authenticated": True,
+        "user": {
+            "id": int(user.get("id") or 0),
+            "email": str(user.get("email") or ""),
+            "display_name": str(user.get("display_name") or ""),
+        },
+    }
+
+
+@app.post("/admin/auth/login")
+async def admin_login(request: Request, body: AdminLoginRequest, response: Response) -> dict[str, Any]:
+    if not settings.admin_session_secret:
+        raise HTTPException(status_code=503, detail="ADMIN_SESSION_SECRET is not configured")
+
+    email = body.email.strip().lower()
+    password = body.password
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="email and password are required")
+
+    user = await repo.get_admin_user_by_email(email)
+    if not user or not verify_password(password, str(user.get("password_hash") or "")):
+        raise HTTPException(status_code=401, detail="Invalid login")
+
+    session_token = make_session_token(
+        int(user["id"]),
+        str(user.get("email") or ""),
+        settings.admin_session_secret,
+        settings.admin_session_hours,
+    )
+    secure_cookie = bool(os.getenv("VERCEL_URL")) or request.url.scheme == "https"
+    response.set_cookie(
+        key=ADMIN_COOKIE_NAME,
+        value=session_token,
+        max_age=settings.admin_session_hours * 3600,
+        httponly=True,
+        secure=secure_cookie,
+        samesite="lax",
+        path="/",
+    )
+    await repo.touch_admin_login(int(user["id"]))
+
+    return {
+        "ok": True,
+        "user": {
+            "id": int(user["id"]),
+            "email": str(user.get("email") or ""),
+            "display_name": str(user.get("display_name") or ""),
+        },
+    }
+
+
+@app.post("/admin/auth/logout")
+async def admin_logout(response: Response) -> dict[str, bool]:
+    response.delete_cookie(ADMIN_COOKIE_NAME, path="/")
+    return {"ok": True}
+
+
 @app.get("/admin/api/whitelist")
 async def admin_list_whitelist(request: Request) -> dict[str, list[dict[str, Any]]]:
-    _assert_admin_auth(request)
+    await _assert_admin_auth(request)
     items = await repo.list_whitelist_contacts()
     return {"items": items}
 
 
 @app.post("/admin/api/whitelist")
 async def admin_upsert_whitelist(request: Request, body: AdminWhitelistUpsert) -> dict[str, Any]:
-    _assert_admin_auth(request)
+    await _assert_admin_auth(request)
     try:
         item = await repo.upsert_whitelist_contact(body.sender_id, body.label)
     except ValueError as exc:
@@ -178,21 +249,21 @@ async def admin_upsert_whitelist(request: Request, body: AdminWhitelistUpsert) -
 
 @app.delete("/admin/api/whitelist/{sender_id}")
 async def admin_delete_whitelist(request: Request, sender_id: str) -> dict[str, bool]:
-    _assert_admin_auth(request)
+    await _assert_admin_auth(request)
     deleted = await repo.remove_whitelist_contact(sender_id)
     return {"deleted": deleted}
 
 
 @app.get("/admin/api/bindings")
 async def admin_list_bindings(request: Request) -> dict[str, list[dict[str, Any]]]:
-    _assert_admin_auth(request)
+    await _assert_admin_auth(request)
     items = await repo.list_task_bindings()
     return {"items": items}
 
 
 @app.post("/admin/api/bindings")
 async def admin_upsert_binding(request: Request, body: AdminBindingUpsert) -> dict[str, Any]:
-    _assert_admin_auth(request)
+    await _assert_admin_auth(request)
     try:
         item = await repo.upsert_task_binding(body.chat_id, body.list_chat_id)
     except ValueError as exc:
@@ -202,7 +273,7 @@ async def admin_upsert_binding(request: Request, body: AdminBindingUpsert) -> di
 
 @app.delete("/admin/api/bindings/{chat_id}")
 async def admin_delete_binding(request: Request, chat_id: str) -> dict[str, bool]:
-    _assert_admin_auth(request)
+    await _assert_admin_auth(request)
     deleted = await repo.remove_task_binding(chat_id)
     return {"deleted": deleted}
 
@@ -213,7 +284,7 @@ async def admin_list_tasks(
     chat_id: str,
     status: str = "open",
 ) -> dict[str, Any]:
-    _assert_admin_auth(request)
+    await _assert_admin_auth(request)
     if status not in {"open", "done", "all"}:
         raise HTTPException(status_code=400, detail="status must be open, done, or all")
 
@@ -233,7 +304,7 @@ async def admin_list_tasks(
 
 @app.post("/admin/api/tasks/batch-add")
 async def admin_batch_add_tasks(request: Request, body: AdminBatchAddRequest) -> dict[str, Any]:
-    _assert_admin_auth(request)
+    await _assert_admin_auth(request)
     lines = [line.strip() for line in body.lines if line and line.strip()]
     if not lines:
         raise HTTPException(status_code=400, detail="No lines to add")
@@ -283,7 +354,7 @@ async def admin_batch_add_tasks(request: Request, body: AdminBatchAddRequest) ->
 
 @app.post("/admin/api/tasks/batch-edit")
 async def admin_batch_edit_tasks(request: Request, body: AdminBatchEditRequest) -> dict[str, Any]:
-    _assert_admin_auth(request)
+    await _assert_admin_auth(request)
     if not body.items:
         raise HTTPException(status_code=400, detail="No items to edit")
     if len(body.items) > 100:
@@ -338,7 +409,7 @@ async def admin_batch_edit_tasks(request: Request, body: AdminBatchEditRequest) 
 
 @app.post("/admin/api/tasks/batch-delete")
 async def admin_batch_delete_tasks(request: Request, body: AdminBatchDeleteRequest) -> dict[str, Any]:
-    _assert_admin_auth(request)
+    await _assert_admin_auth(request)
     raw_ids = [int(task_no) for task_no in body.task_nos]
     task_nos = sorted({task_no for task_no in raw_ids if task_no > 0})
     if not task_nos:
@@ -491,25 +562,43 @@ def _assert_cron_auth(request: Request) -> None:
     raise HTTPException(status_code=401, detail="Unauthorized cron call")
 
 
-def _assert_admin_auth(request: Request) -> None:
-    if not settings.admin_token:
-        raise HTTPException(status_code=503, detail="ADMIN_TOKEN is not configured")
-
-    header_token = request.headers.get("x-admin-token", "").strip()
-    query_token = request.query_params.get("token", "").strip()
-    bearer_token = _extract_bearer_token(request.headers.get("authorization", ""))
-
-    provided = header_token or bearer_token or query_token
-    if not provided or not hmac.compare_digest(provided, settings.admin_token):
-        raise HTTPException(status_code=401, detail="Unauthorized admin token")
+async def _assert_admin_auth(request: Request) -> dict[str, Any]:
+    user = await _get_admin_user_from_request(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized admin session")
+    return user
 
 
-def _extract_bearer_token(auth_header: str) -> str:
-    if not auth_header:
-        return ""
-    if not auth_header.lower().startswith("bearer "):
-        return ""
-    return auth_header.split(" ", 1)[1].strip()
+async def _get_admin_user_from_request(request: Request) -> dict[str, Any] | None:
+    if not settings.admin_session_secret:
+        return None
+
+    token = request.cookies.get(ADMIN_COOKIE_NAME, "").strip()
+    if not token:
+        return None
+
+    payload = parse_session_token(token, settings.admin_session_secret)
+    if not payload:
+        return None
+
+    uid_raw = payload.get("uid")
+    if uid_raw in (None, ""):
+        return None
+
+    try:
+        user_id = int(uid_raw)
+    except (TypeError, ValueError):
+        return None
+
+    user = await repo.get_admin_user_by_id(user_id)
+    if not user:
+        return None
+
+    email = str(payload.get("email") or "").strip().lower()
+    if email and not hmac.compare_digest(email, str(user.get("email") or "").strip().lower()):
+        return None
+
+    return user
 
 
 def _is_configured(value: str) -> bool:
@@ -574,10 +663,11 @@ async def _build_status_snapshot() -> dict[str, object]:
         "SUPABASE_SERVICE_ROLE_KEY": _is_configured(settings.supabase_service_role_key),
         "OPENAI_API_KEY": _is_configured(settings.openai_api_key),
         "CRON_SECRET": _is_configured(settings.cron_secret),
-        "ADMIN_TOKEN": _is_configured(settings.admin_token),
+        "ADMIN_SESSION_SECRET": _is_configured(settings.admin_session_secret),
     }
 
     supabase = await repo.health_check()
+    admin_store = await repo.admin_user_store_health_check()
     whatsapp_api = await whatsapp_client.health_check()
 
     checks = {
@@ -606,8 +696,13 @@ async def _build_status_snapshot() -> dict[str, object]:
             "detail": "Protects /internal/daily-push",
         },
         "admin_auth": {
-            "ok": env_status["ADMIN_TOKEN"],
-            "detail": "Protects /admin/api/*",
+            "ok": env_status["ADMIN_SESSION_SECRET"],
+            "detail": "Protects /admin session cookie",
+        },
+        "admin_user_store": {
+            "ok": bool(admin_store.get("ok")),
+            "detail": "Supabase table admin_users",
+            **({"error": admin_store.get("error")} if not admin_store.get("ok") else {}),
         },
     }
 
@@ -803,7 +898,7 @@ def _serialize_task_for_admin(task: dict[str, Any], timezone_name: str) -> dict[
 
 
 def _render_admin_html() -> str:
-    return """
+    return f"""
 <!doctype html>
 <html lang="en">
   <head>
@@ -811,7 +906,7 @@ def _render_admin_html() -> str:
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Admin Console</title>
     <style>
-      :root {
+      :root {{
         --bg: #111111;
         --panel: #1f1f1f;
         --text: #ffffff;
@@ -819,101 +914,103 @@ def _render_admin_html() -> str:
         --line: #374151;
         --accent: #f97316;
         --danger: #ef4444;
-      }
-      * { box-sizing: border-box; }
-      body {
+      }}
+      * {{ box-sizing: border-box; }}
+      body {{
         margin: 0;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         background: linear-gradient(180deg, #0f0f0f 0%, #181818 100%);
         color: var(--text);
         padding: 20px;
-      }
-      .container {
+      }}
+      .container {{
         max-width: 1200px;
         margin: 0 auto;
-      }
-      .card {
+      }}
+      .card {{
         background: var(--panel);
         border: 1px solid var(--line);
         border-radius: 12px;
         padding: 14px;
         margin-bottom: 14px;
-      }
-      h1, h2, h3 { margin: 0 0 10px 0; }
-      h1 { font-size: 22px; }
-      h2 { font-size: 18px; }
-      .muted { color: var(--muted); font-size: 13px; }
-      .grid {
+      }}
+      h1, h2, h3 {{ margin: 0 0 10px 0; }}
+      h1 {{ font-size: 22px; }}
+      h2 {{ font-size: 18px; }}
+      .muted {{ color: var(--muted); font-size: 13px; }}
+      .ok {{ color: #22c55e; }}
+      .hidden {{ display: none; }}
+      .grid {{
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
         gap: 14px;
-      }
-      label {
+      }}
+      label {{
         display: block;
         font-size: 12px;
         color: #d1d5db;
         margin-bottom: 4px;
-      }
-      input, textarea, select, button {
+      }}
+      input, textarea, select, button {{
         width: 100%;
         padding: 9px 10px;
         border-radius: 8px;
         border: 1px solid #4b5563;
         background: #111827;
         color: #fff;
-      }
-      textarea {
+      }}
+      textarea {{
         min-height: 92px;
         resize: vertical;
-      }
-      button {
+      }}
+      button {{
         cursor: pointer;
         background: var(--accent);
         border-color: #fb923c;
         font-weight: 600;
-      }
-      button.secondary {
+      }}
+      button.secondary {{
         background: #374151;
         border-color: #4b5563;
-      }
-      button.danger {
+      }}
+      button.danger {{
         background: #7f1d1d;
         border-color: #991b1b;
-      }
-      .row {
+      }}
+      .row {{
         display: grid;
         grid-template-columns: 1fr 1fr auto;
         gap: 8px;
         margin-bottom: 8px;
-      }
-      .row.single {
+      }}
+      .row.single {{
         grid-template-columns: 1fr auto;
-      }
-      table {
+      }}
+      table {{
         width: 100%;
         border-collapse: collapse;
-      }
-      th, td {
+      }}
+      th, td {{
         border-bottom: 1px solid var(--line);
         text-align: left;
         padding: 8px 6px;
         font-size: 13px;
         vertical-align: top;
-      }
-      th {
+      }}
+      th {{
         color: #d1d5db;
         font-size: 12px;
         text-transform: uppercase;
-      }
-      .pill {
+      }}
+      .pill {{
         display: inline-block;
         border: 1px solid #4b5563;
         border-radius: 999px;
         padding: 2px 8px;
         font-size: 12px;
-      }
-      .spacer { height: 8px; }
-      pre {
+      }}
+      .spacer {{ height: 8px; }}
+      pre {{
         margin: 0;
         padding: 10px;
         border: 1px solid var(--line);
@@ -922,392 +1019,448 @@ def _render_admin_html() -> str:
         color: #d1d5db;
         overflow: auto;
         font-size: 12px;
-      }
-      .inline-actions {
+      }}
+      .inline-actions {{
         display: flex;
         gap: 8px;
-      }
-      .inline-actions button {
+      }}
+      .inline-actions button {{
         width: auto;
-      }
+      }}
     </style>
   </head>
   <body>
     <div class="container">
       <h1>WhatsApp ADHD Bot Admin</h1>
-      <p class="muted">管理白名單、共享 task list、批量任務操作。先輸入 ADMIN_TOKEN。</p>
+      <p class="muted">登入後可管理白名單、共享 task list、批量任務。</p>
 
-      <div class="card">
+      <div class="card" id="login-card">
+        <h2>Admin Login</h2>
         <div class="row single">
           <div>
-            <label for="admin-token">ADMIN_TOKEN</label>
-            <input id="admin-token" type="password" placeholder="paste your ADMIN_TOKEN" />
+            <label for="login-email">Email</label>
+            <input id="login-email" type="email" placeholder="admin@example.com" />
           </div>
-          <button id="save-token" style="align-self:end;width:160px;">Save Token</button>
+          <div style="display:none;"></div>
         </div>
-        <p class="muted" id="token-status">Token 未設定</p>
+        <div class="row single">
+          <div>
+            <label for="login-password">Password</label>
+            <input id="login-password" type="password" placeholder="password" />
+          </div>
+          <button id="login-btn" style="align-self:end;width:160px;">Login</button>
+        </div>
+        <p class="muted" id="login-status">未登入</p>
       </div>
 
-      <div class="grid">
-        <div class="card">
-          <h2>Whitelist</h2>
-          <div class="row">
-            <div>
-              <label for="wl-phone">Phone Number</label>
-              <input id="wl-phone" placeholder="85291234567" />
-            </div>
-            <div>
-              <label for="wl-label">Label</label>
-              <input id="wl-label" placeholder="Tom / Team A" />
-            </div>
-            <button id="wl-add" style="align-self:end;width:120px;">Add/Update</button>
-          </div>
-          <div class="inline-actions" style="margin-bottom:8px;">
-            <button class="secondary" id="wl-refresh">Refresh</button>
-          </div>
-          <table>
-            <thead><tr><th>sender_id</th><th>label</th><th>created_at</th><th></th></tr></thead>
-            <tbody id="wl-tbody"></tbody>
-          </table>
-        </div>
-
-        <div class="card">
-          <h2>Shared Task Lists</h2>
-          <div class="row">
-            <div>
-              <label for="bind-chat">Chat ID / Phone</label>
-              <input id="bind-chat" placeholder="85291234567 or group id" />
-            </div>
-            <div>
-              <label for="bind-list">List Owner Chat ID</label>
-              <input id="bind-list" placeholder="85290001111" />
-            </div>
-            <button id="bind-save" style="align-self:end;width:120px;">Save</button>
-          </div>
-          <div class="inline-actions" style="margin-bottom:8px;">
-            <button class="secondary" id="bind-refresh">Refresh</button>
-          </div>
-          <table>
-            <thead><tr><th>chat_id</th><th>list_chat_id</th><th>updated_at</th><th></th></tr></thead>
-            <tbody id="bind-tbody"></tbody>
-          </table>
+      <div class="card hidden" id="session-card">
+        <div class="inline-actions" style="justify-content:space-between;align-items:center;">
+          <p id="session-user" class="ok" style="margin:0;">已登入</p>
+          <button class="secondary" id="logout-btn">Logout</button>
         </div>
       </div>
 
-      <div class="card">
-        <h2>Tasks (Batch Add / Edit / Delete)</h2>
-        <div class="row">
-          <div>
-            <label for="task-chat-id">Chat ID / Phone</label>
-            <input id="task-chat-id" placeholder="85291234567 or group id" />
+      <div id="admin-app" class="hidden">
+        <div class="grid">
+          <div class="card">
+            <h2>Whitelist</h2>
+            <div class="row">
+              <div>
+                <label for="wl-phone">Phone Number</label>
+                <input id="wl-phone" placeholder="85291234567" />
+              </div>
+              <div>
+                <label for="wl-label">Label</label>
+                <input id="wl-label" placeholder="Tom / Team A" />
+              </div>
+              <button id="wl-add" style="align-self:end;width:120px;">Add/Update</button>
+            </div>
+            <div class="inline-actions" style="margin-bottom:8px;">
+              <button class="secondary" id="wl-refresh">Refresh</button>
+            </div>
+            <table>
+              <thead><tr><th>sender_id</th><th>label</th><th>created_at</th><th></th></tr></thead>
+              <tbody id="wl-tbody"></tbody>
+            </table>
           </div>
-          <div>
-            <label for="task-status">Status</label>
-            <select id="task-status">
-              <option value="open">open</option>
-              <option value="done">done</option>
-              <option value="all">all</option>
-            </select>
+
+          <div class="card">
+            <h2>Shared Task Lists</h2>
+            <div class="row">
+              <div>
+                <label for="bind-chat">Chat ID / Phone</label>
+                <input id="bind-chat" placeholder="85291234567 or group id" />
+              </div>
+              <div>
+                <label for="bind-list">List Owner Chat ID</label>
+                <input id="bind-list" placeholder="85290001111" />
+              </div>
+              <button id="bind-save" style="align-self:end;width:120px;">Save</button>
+            </div>
+            <div class="inline-actions" style="margin-bottom:8px;">
+              <button class="secondary" id="bind-refresh">Refresh</button>
+            </div>
+            <table>
+              <thead><tr><th>chat_id</th><th>list_chat_id</th><th>updated_at</th><th></th></tr></thead>
+              <tbody id="bind-tbody"></tbody>
+            </table>
           </div>
-          <button id="task-load" style="align-self:end;width:120px;">Load</button>
         </div>
 
-        <div class="spacer"></div>
-        <table>
-          <thead>
-            <tr>
-              <th>#</th>
-              <th>priority</th>
-              <th>title</th>
-              <th>due (local)</th>
-              <th>status</th>
-            </tr>
-          </thead>
-          <tbody id="task-tbody"></tbody>
-        </table>
+        <div class="card">
+          <h2>Tasks (Batch Add / Edit / Delete)</h2>
+          <div class="row">
+            <div>
+              <label for="task-chat-id">Chat ID / Phone</label>
+              <input id="task-chat-id" placeholder="85291234567 or group id" />
+            </div>
+            <div>
+              <label for="task-status">Status</label>
+              <select id="task-status">
+                <option value="open">open</option>
+                <option value="done">done</option>
+                <option value="all">all</option>
+              </select>
+            </div>
+            <button id="task-load" style="align-self:end;width:120px;">Load</button>
+          </div>
 
-        <div class="spacer"></div>
-        <h3>Batch Add (自然語言，一行一項)</h3>
-        <textarea id="batch-add-lines" placeholder="明天 3pm 跟客開會&#10;週四 9am 回覆電郵"></textarea>
-        <div class="inline-actions" style="margin-top:8px;">
-          <button id="batch-add-btn">Batch Add</button>
+          <div class="spacer"></div>
+          <table>
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>priority</th>
+                <th>title</th>
+                <th>due (local)</th>
+                <th>status</th>
+              </tr>
+            </thead>
+            <tbody id="task-tbody"></tbody>
+          </table>
+
+          <div class="spacer"></div>
+          <h3>Batch Add (自然語言，一行一項)</h3>
+          <textarea id="batch-add-lines" placeholder="明天 3pm 跟客開會&#10;週四 9am 回覆電郵"></textarea>
+          <div class="inline-actions" style="margin-top:8px;">
+            <button id="batch-add-btn">Batch Add</button>
+          </div>
+
+          <div class="spacer"></div>
+          <h3>Batch Edit (格式: task_id | 新內容)</h3>
+          <textarea id="batch-edit-lines" placeholder="3 | 明天 4pm 跟客開會&#10;8 | 週五 中午 交 proposal"></textarea>
+          <div class="inline-actions" style="margin-top:8px;">
+            <button id="batch-edit-btn">Batch Edit</button>
+          </div>
+
+          <div class="spacer"></div>
+          <h3>Batch Delete (輸入 task_id，空格/逗號分隔)</h3>
+          <input id="batch-delete-ids" placeholder="3 5 8" />
+          <div class="inline-actions" style="margin-top:8px;">
+            <button class="danger" id="batch-delete-btn">Batch Delete</button>
+          </div>
+
+          <div class="spacer"></div>
+          <pre id="ops-result">Ready.</pre>
         </div>
-
-        <div class="spacer"></div>
-        <h3>Batch Edit (格式: task_id | 新內容)</h3>
-        <textarea id="batch-edit-lines" placeholder="3 | 明天 4pm 跟客開會&#10;8 | 週五 中午 交 proposal"></textarea>
-        <div class="inline-actions" style="margin-top:8px;">
-          <button id="batch-edit-btn">Batch Edit</button>
-        </div>
-
-        <div class="spacer"></div>
-        <h3>Batch Delete (輸入 task_id，空格/逗號分隔)</h3>
-        <input id="batch-delete-ids" placeholder="3 5 8" />
-        <div class="inline-actions" style="margin-top:8px;">
-          <button class="danger" id="batch-delete-btn">Batch Delete</button>
-        </div>
-
-        <div class="spacer"></div>
-        <pre id="ops-result">Ready.</pre>
       </div>
     </div>
 
     <script>
-      const qs = new URLSearchParams(window.location.search);
-      const tokenInput = document.getElementById("admin-token");
-      const tokenStatus = document.getElementById("token-status");
+      const loginCard = document.getElementById("login-card");
+      const loginStatus = document.getElementById("login-status");
+      const sessionCard = document.getElementById("session-card");
+      const sessionUser = document.getElementById("session-user");
+      const adminApp = document.getElementById("admin-app");
 
-      tokenInput.value = qs.get("token") || localStorage.getItem("admin_token") || "";
-      updateTokenStatus();
-
-      document.getElementById("save-token").addEventListener("click", () => {
-        localStorage.setItem("admin_token", tokenInput.value.trim());
-        updateTokenStatus();
-      });
-
-      function updateTokenStatus() {
-        tokenStatus.textContent = tokenInput.value.trim() ? "Token 已設定" : "Token 未設定";
-      }
-
-      function authHeaders(json = true) {
-        const token = tokenInput.value.trim();
-        const headers = { "X-Admin-Token": token };
-        if (json) headers["Content-Type"] = "application/json";
-        return headers;
-      }
-
-      async function api(path, options = {}) {
-        const opts = { ...options };
-        opts.headers = { ...authHeaders(!opts.noJson), ...(opts.headers || {}) };
-        if (opts.noJson) {
-          delete opts.headers["Content-Type"];
-          delete opts.noJson;
-        }
-        const resp = await fetch(path, opts);
-        if (!resp.ok) {
-          const text = await resp.text();
-          throw new Error(text || `HTTP ${resp.status}`);
-        }
-        return resp.json();
-      }
-
-      function showResult(data) {
+      function showResult(data) {{
         document.getElementById("ops-result").textContent = JSON.stringify(data, null, 2);
-      }
+      }}
 
-      function currentTaskChatId() {
-        return document.getElementById("task-chat-id").value.trim();
-      }
+      function setLoggedIn(user) {{
+        loginCard.classList.add("hidden");
+        sessionCard.classList.remove("hidden");
+        adminApp.classList.remove("hidden");
+        sessionUser.textContent = `已登入：${{user.display_name || user.email || user.id}}`;
+      }}
 
-      async function loadWhitelist() {
+      function setLoggedOut(message) {{
+        loginCard.classList.remove("hidden");
+        sessionCard.classList.add("hidden");
+        adminApp.classList.add("hidden");
+        loginStatus.textContent = message || "未登入";
+      }}
+
+      async function api(path, options = {{}}) {{
+        const opts = {{ ...options }};
+        opts.credentials = "include";
+        opts.headers = {{ ...(opts.headers || {{}}) }};
+        if (opts.body && !opts.headers["Content-Type"]) {{
+          opts.headers["Content-Type"] = "application/json";
+        }}
+        const resp = await fetch(path, opts);
+        if (resp.status === 401) {{
+          setLoggedOut("登入已失效，請重新登入");
+          throw new Error("Unauthorized");
+        }}
+        if (!resp.ok) {{
+          const text = await resp.text();
+          throw new Error(text || `HTTP ${{resp.status}}`);
+        }}
+        return resp.json();
+      }}
+
+      async function checkSession() {{
+        const data = await api("/admin/auth/me");
+        if (data.authenticated) {{
+          setLoggedIn(data.user || {{}});
+          await loadWhitelist();
+          await loadBindings();
+          return;
+        }}
+        setLoggedOut("未登入");
+      }}
+
+      async function loadWhitelist() {{
         const data = await api("/admin/api/whitelist");
         const tbody = document.getElementById("wl-tbody");
         tbody.innerHTML = "";
-        for (const item of data.items || []) {
+        for (const item of data.items || []) {{
           const tr = document.createElement("tr");
           tr.innerHTML = `
-            <td>${item.sender_id || ""}</td>
-            <td>${item.label || ""}</td>
-            <td>${item.created_at || ""}</td>
-            <td><button class="danger" data-del="${item.sender_id || ""}">Delete</button></td>
+            <td>${{item.sender_id || ""}}</td>
+            <td>${{item.label || ""}}</td>
+            <td>${{item.created_at || ""}}</td>
+            <td><button class="danger" data-del="${{item.sender_id || ""}}">Delete</button></td>
           `;
           tbody.appendChild(tr);
-        }
-        for (const btn of tbody.querySelectorAll("button[data-del]")) {
-          btn.addEventListener("click", async () => {
-            try {
-              await api(`/admin/api/whitelist/${encodeURIComponent(btn.dataset.del)}`, { method: "DELETE", noJson: true });
+        }}
+        for (const btn of tbody.querySelectorAll("button[data-del]")) {{
+          btn.addEventListener("click", async () => {{
+            try {{
+              await api(`/admin/api/whitelist/${{encodeURIComponent(btn.dataset.del)}}`, {{ method: "DELETE" }});
               await loadWhitelist();
-            } catch (err) {
-              alert(err.message);
-            }
-          });
-        }
-        showResult({ whitelist_count: (data.items || []).length });
-      }
+            }} catch (err) {{
+              if (err.message !== "Unauthorized") alert(err.message);
+            }}
+          }});
+        }}
+        showResult({{ whitelist_count: (data.items || []).length }});
+      }}
 
-      async function loadBindings() {
+      async function loadBindings() {{
         const data = await api("/admin/api/bindings");
         const tbody = document.getElementById("bind-tbody");
         tbody.innerHTML = "";
-        for (const item of data.items || []) {
+        for (const item of data.items || []) {{
           const tr = document.createElement("tr");
           tr.innerHTML = `
-            <td>${item.chat_id || ""}</td>
-            <td>${item.list_chat_id || ""}</td>
-            <td>${item.updated_at || ""}</td>
-            <td><button class="danger" data-del="${item.chat_id || ""}">Delete</button></td>
+            <td>${{item.chat_id || ""}}</td>
+            <td>${{item.list_chat_id || ""}}</td>
+            <td>${{item.updated_at || ""}}</td>
+            <td><button class="danger" data-del="${{item.chat_id || ""}}">Delete</button></td>
           `;
           tbody.appendChild(tr);
-        }
-        for (const btn of tbody.querySelectorAll("button[data-del]")) {
-          btn.addEventListener("click", async () => {
-            try {
-              await api(`/admin/api/bindings/${encodeURIComponent(btn.dataset.del)}`, { method: "DELETE", noJson: true });
+        }}
+        for (const btn of tbody.querySelectorAll("button[data-del]")) {{
+          btn.addEventListener("click", async () => {{
+            try {{
+              await api(`/admin/api/bindings/${{encodeURIComponent(btn.dataset.del)}}`, {{ method: "DELETE" }});
               await loadBindings();
-            } catch (err) {
-              alert(err.message);
-            }
-          });
-        }
-        showResult({ binding_count: (data.items || []).length });
-      }
+            }} catch (err) {{
+              if (err.message !== "Unauthorized") alert(err.message);
+            }}
+          }});
+        }}
+        showResult({{ binding_count: (data.items || []).length }});
+      }}
 
-      async function loadTasks() {
+      function currentTaskChatId() {{
+        return document.getElementById("task-chat-id").value.trim();
+      }}
+
+      async function loadTasks() {{
         const chatId = currentTaskChatId();
-        if (!chatId) {
+        if (!chatId) {{
           alert("請先輸入 Chat ID / Phone");
           return;
-        }
+        }}
         const status = document.getElementById("task-status").value;
-        const data = await api(`/admin/api/tasks?chat_id=${encodeURIComponent(chatId)}&status=${encodeURIComponent(status)}`);
+        const data = await api(`/admin/api/tasks?chat_id=${{encodeURIComponent(chatId)}}&status=${{encodeURIComponent(status)}}`);
         const tbody = document.getElementById("task-tbody");
         tbody.innerHTML = "";
-        for (const task of data.tasks || []) {
+        for (const task of data.tasks || []) {{
           const tr = document.createElement("tr");
           tr.innerHTML = `
-            <td><span class="pill">#${task.task_no}</span></td>
-            <td>${task.priority}</td>
-            <td>${task.title || ""}</td>
-            <td>${task.due_local || "未排程"}</td>
-            <td>${task.status || ""}</td>
+            <td><span class="pill">#${{task.task_no}}</span></td>
+            <td>${{task.priority}}</td>
+            <td>${{task.title || ""}}</td>
+            <td>${{task.due_local || "未排程"}}</td>
+            <td>${{task.status || ""}}</td>
           `;
           tbody.appendChild(tr);
-        }
-        showResult({
+        }}
+        showResult({{
           chat_id: data.chat_id,
           scope_chat_id: data.scope_chat_id,
           timezone: data.timezone,
           task_count: (data.tasks || []).length
-        });
-      }
+        }});
+      }}
 
-      document.getElementById("wl-add").addEventListener("click", async () => {
-        try {
+      document.getElementById("login-btn").addEventListener("click", async () => {{
+        const email = document.getElementById("login-email").value.trim();
+        const password = document.getElementById("login-password").value;
+        if (!email || !password) {{
+          loginStatus.textContent = "請輸入 email 和 password";
+          return;
+        }}
+        try {{
+          const data = await api("/admin/auth/login", {{
+            method: "POST",
+            body: JSON.stringify({{ email, password }})
+          }});
+          setLoggedIn(data.user || {{}});
+          loginStatus.textContent = "登入成功";
+          await loadWhitelist();
+          await loadBindings();
+        }} catch (err) {{
+          loginStatus.textContent = "登入失敗";
+          alert(err.message);
+        }}
+      }});
+
+      document.getElementById("logout-btn").addEventListener("click", async () => {{
+        try {{
+          await api("/admin/auth/logout", {{ method: "POST" }});
+        }} catch (err) {{
+          if (err.message !== "Unauthorized") alert(err.message);
+        }}
+        setLoggedOut("已登出");
+      }});
+
+      document.getElementById("wl-add").addEventListener("click", async () => {{
+        try {{
           const sender_id = document.getElementById("wl-phone").value.trim();
           const label = document.getElementById("wl-label").value.trim();
-          if (!sender_id) {
+          if (!sender_id) {{
             alert("請輸入電話號碼");
             return;
-          }
-          const data = await api("/admin/api/whitelist", {
+          }}
+          const data = await api("/admin/api/whitelist", {{
             method: "POST",
-            body: JSON.stringify({ sender_id, label })
-          });
+            body: JSON.stringify({{ sender_id, label }})
+          }});
           showResult(data);
           await loadWhitelist();
-        } catch (err) {
-          alert(err.message);
-        }
-      });
+        }} catch (err) {{
+          if (err.message !== "Unauthorized") alert(err.message);
+        }}
+      }});
 
-      document.getElementById("wl-refresh").addEventListener("click", () => loadWhitelist().catch(err => alert(err.message)));
+      document.getElementById("wl-refresh").addEventListener("click", () => loadWhitelist().catch(err => err.message !== "Unauthorized" && alert(err.message)));
 
-      document.getElementById("bind-save").addEventListener("click", async () => {
-        try {
+      document.getElementById("bind-save").addEventListener("click", async () => {{
+        try {{
           const chat_id = document.getElementById("bind-chat").value.trim();
           const list_chat_id = document.getElementById("bind-list").value.trim();
-          if (!chat_id || !list_chat_id) {
+          if (!chat_id || !list_chat_id) {{
             alert("請輸入 chat_id 與 list_chat_id");
             return;
-          }
-          const data = await api("/admin/api/bindings", {
+          }}
+          const data = await api("/admin/api/bindings", {{
             method: "POST",
-            body: JSON.stringify({ chat_id, list_chat_id })
-          });
+            body: JSON.stringify({{ chat_id, list_chat_id }})
+          }});
           showResult(data);
           await loadBindings();
-        } catch (err) {
-          alert(err.message);
-        }
-      });
+        }} catch (err) {{
+          if (err.message !== "Unauthorized") alert(err.message);
+        }}
+      }});
 
-      document.getElementById("bind-refresh").addEventListener("click", () => loadBindings().catch(err => alert(err.message)));
-      document.getElementById("task-load").addEventListener("click", () => loadTasks().catch(err => alert(err.message)));
+      document.getElementById("bind-refresh").addEventListener("click", () => loadBindings().catch(err => err.message !== "Unauthorized" && alert(err.message)));
+      document.getElementById("task-load").addEventListener("click", () => loadTasks().catch(err => err.message !== "Unauthorized" && alert(err.message)));
 
-      document.getElementById("batch-add-btn").addEventListener("click", async () => {
-        try {
+      document.getElementById("batch-add-btn").addEventListener("click", async () => {{
+        try {{
           const chat_id = currentTaskChatId();
-          if (!chat_id) {
+          if (!chat_id) {{
             alert("請先輸入 Chat ID / Phone");
             return;
-          }
+          }}
           const lines = document.getElementById("batch-add-lines").value.split("\\n").map(s => s.trim()).filter(Boolean);
-          const data = await api("/admin/api/tasks/batch-add", {
+          const data = await api("/admin/api/tasks/batch-add", {{
             method: "POST",
-            body: JSON.stringify({ chat_id, lines })
-          });
+            body: JSON.stringify({{ chat_id, lines }})
+          }});
           showResult(data);
           await loadTasks();
-        } catch (err) {
-          alert(err.message);
-        }
-      });
+        }} catch (err) {{
+          if (err.message !== "Unauthorized") alert(err.message);
+        }}
+      }});
 
-      document.getElementById("batch-edit-btn").addEventListener("click", async () => {
-        try {
+      document.getElementById("batch-edit-btn").addEventListener("click", async () => {{
+        try {{
           const chat_id = currentTaskChatId();
-          if (!chat_id) {
+          if (!chat_id) {{
             alert("請先輸入 Chat ID / Phone");
             return;
-          }
+          }}
           const lines = document.getElementById("batch-edit-lines").value.split("\\n").map(s => s.trim()).filter(Boolean);
           const items = [];
-          for (const line of lines) {
+          for (const line of lines) {{
             const parts = line.split("|");
             if (parts.length < 2) continue;
             const task_no = Number(parts[0].trim());
             const text = parts.slice(1).join("|").trim();
             if (!Number.isFinite(task_no) || task_no <= 0 || !text) continue;
-            items.push({ task_no, text });
-          }
-          if (!items.length) {
+            items.push({{ task_no, text }});
+          }}
+          if (!items.length) {{
             alert("格式錯誤，請用：task_id | 新內容");
             return;
-          }
-          const data = await api("/admin/api/tasks/batch-edit", {
+          }}
+          const data = await api("/admin/api/tasks/batch-edit", {{
             method: "POST",
-            body: JSON.stringify({ chat_id, items })
-          });
+            body: JSON.stringify({{ chat_id, items }})
+          }});
           showResult(data);
           await loadTasks();
-        } catch (err) {
-          alert(err.message);
-        }
-      });
+        }} catch (err) {{
+          if (err.message !== "Unauthorized") alert(err.message);
+        }}
+      }});
 
-      document.getElementById("batch-delete-btn").addEventListener("click", async () => {
-        try {
+      document.getElementById("batch-delete-btn").addEventListener("click", async () => {{
+        try {{
           const chat_id = currentTaskChatId();
-          if (!chat_id) {
+          if (!chat_id) {{
             alert("請先輸入 Chat ID / Phone");
             return;
-          }
+          }}
           const raw = document.getElementById("batch-delete-ids").value;
           const task_nos = Array.from(new Set(raw.split(/[\\s,]+/).map(s => Number(s.trim())).filter(n => Number.isFinite(n) && n > 0)));
-          if (!task_nos.length) {
+          if (!task_nos.length) {{
             alert("請輸入至少一個 task id");
             return;
-          }
-          const data = await api("/admin/api/tasks/batch-delete", {
+          }}
+          const data = await api("/admin/api/tasks/batch-delete", {{
             method: "POST",
-            body: JSON.stringify({ chat_id, task_nos })
-          });
+            body: JSON.stringify({{ chat_id, task_nos }})
+          }});
           showResult(data);
           await loadTasks();
-        } catch (err) {
-          alert(err.message);
-        }
-      });
+        }} catch (err) {{
+          if (err.message !== "Unauthorized") alert(err.message);
+        }}
+      }});
 
-      (async () => {
-        try {
-          await loadWhitelist();
-          await loadBindings();
-        } catch (err) {
-          showResult({ error: err.message });
-        }
-      })();
+      checkSession().catch(err => {{
+        setLoggedOut("未登入");
+        showResult({{ error: err.message }});
+      }});
     </script>
   </body>
 </html>
