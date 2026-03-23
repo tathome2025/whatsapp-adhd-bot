@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     daily_push_time: str = "09:00"
     max_daily_tasks: int = 6
     cron_secret: str = ""
+    admin_token: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

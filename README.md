@@ -5,6 +5,9 @@
 - `list` / `today` / `done <id...>` / `delete <id...>` / `edit <id> <text>` 指令
 - 每日推播今日任務
 - 串接 OpenAI API，按 ADHD 友善方式安排順序
+- 白名單控制（只有白名單電話可觸發 bot 回覆）
+- 共享 task list（多個電話號碼可共用同一份任務清單）
+- Web 管理介面（批量 add/edit/delete 任務）
 
 ## 1. 專案結構
 
@@ -46,6 +49,7 @@ TIMEZONE=Asia/Hong_Kong
 DAILY_PUSH_TIME=09:00
 MAX_DAILY_TASKS=6
 CRON_SECRET=
+ADMIN_TOKEN=
 ```
 
 ## 4. 本地啟動
@@ -99,13 +103,30 @@ Webhook 驗證 URL：
   - App / Supabase / Webhook / OpenAI / Cron 是否就緒
   - 哪些 env 還未設定
 
-## 9. 法務頁（Meta 用）
+## 9. 管理頁（Web UI）
+
+- `GET /admin`: 管理主控台（黑 / 白 / 灰 / 橙主調）
+- API 需要 `X-Admin-Token: <ADMIN_TOKEN>`（或 `Authorization: Bearer <ADMIN_TOKEN>`）
+
+功能：
+- 白名單：新增 / 修改 / 刪除可回應 bot 的電話號碼
+- Shared list：設定 `chat_id -> list_chat_id`，讓多個 chat 共用同一份 task list
+- Tasks 批量操作：
+  - Batch Add：每行一個自然語言任務（會自動解析時間、優先度）
+  - Batch Edit：格式 `task_id | 新內容`
+  - Batch Delete：輸入多個 task_id
+
+備註：
+- bot 收到訊息時先檢查 `sender_id` 是否在白名單，不在則忽略
+- 任務編號 `task_no` 會以每個 task list（`chat_id`）獨立重新計數
+
+## 10. 法務頁（Meta 用）
 
 - `GET /privacy`: Privacy Policy
 - `GET /data-deletion`: Data Deletion Instructions
 - 建議在 Vercel 設定 `PRIVACY_CONTACT_EMAIL` 作為聯絡電郵
 
-## 10. ADHD 排程設計
+## 11. ADHD 排程設計
 
 流程：
 1. 先取出當日任務
@@ -118,7 +139,7 @@ Webhook 驗證 URL：
 - `reasons`
 - `suggested_time_blocks`
 
-## 11. 視覺主調（若日後做 Dashboard）
+## 12. 視覺主調（Status/Admin）
 
 建議色票（黑/白/灰/橙）：
 - `#111111`

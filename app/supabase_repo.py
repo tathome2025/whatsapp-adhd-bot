@@ -1,11 +1,31 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 
 from app.config import Settings
+
+
+def _normalize_phone(value: str) -> str:
+    return re.sub(r"\D+", "", value or "")
+
+
+def _normalize_chat_id(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+
+    if raw.endswith("@g.us"):
+        return raw
+
+    if re.fullmatch(r"\d+-\d+", raw):
+        return raw
+
+    digits = _normalize_phone(raw)
+    return digits or raw
 
 
 class SupabaseRepo:
@@ -49,6 +69,8 @@ class SupabaseRepo:
         return response.json()
 
     async def create_task(self, task: dict[str, Any]) -> dict[str, Any] | None:
+        task = {**task, "chat_id": _normalize_chat_id(str(task.get("chat_id") or ""))}
+
         data = await self._request(
             "POST",
             "tasks",
@@ -76,6 +98,7 @@ class SupabaseRepo:
         return existing[0] if existing else None
 
     async def list_open_tasks(self, chat_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        chat_id = _normalize_chat_id(chat_id)
         data = await self._request(
             "GET",
             "tasks",
@@ -89,6 +112,19 @@ class SupabaseRepo:
         )
         return data or []
 
+    async def list_tasks(self, chat_id: str, status: str = "open", limit: int = 500) -> list[dict[str, Any]]:
+        chat_id = _normalize_chat_id(chat_id)
+        params: dict[str, str] = {
+            "select": "*",
+            "chat_id": f"eq.{chat_id}",
+            "order": "status.asc,due_at.asc.nullslast,priority.desc,created_at.asc",
+            "limit": str(limit),
+        }
+        if status in {"open", "done"}:
+            params["status"] = f"eq.{status}"
+        data = await self._request("GET", "tasks", params=params)
+        return data or []
+
     async def list_tasks_for_date(
         self,
         chat_id: str,
@@ -96,6 +132,7 @@ class SupabaseRepo:
         end_utc_iso: str,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
+        chat_id = _normalize_chat_id(chat_id)
         data = await self._request(
             "GET",
             "tasks",
@@ -112,6 +149,7 @@ class SupabaseRepo:
         return data or []
 
     async def get_open_task_by_task_no(self, chat_id: str, task_no: int) -> dict[str, Any] | None:
+        chat_id = _normalize_chat_id(chat_id)
         tasks = await self._request(
             "GET",
             "tasks",
@@ -125,25 +163,8 @@ class SupabaseRepo:
         )
         return tasks[0] if tasks else None
 
-    async def mark_done(self, chat_id: str, task_id: int) -> dict[str, Any] | None:
-        payload = {
-            "status": "done",
-            "completed_at": datetime.now(timezone.utc).isoformat(),
-        }
-        updated = await self._request(
-            "PATCH",
-            "tasks",
-            params={
-                "chat_id": f"eq.{chat_id}",
-                "id": f"eq.{task_id}",
-                "status": "eq.open",
-            },
-            json_data=payload,
-            prefer="return=representation",
-        )
-        return updated[0] if updated else None
-
     async def mark_done_by_task_no(self, chat_id: str, task_no: int) -> dict[str, Any] | None:
+        chat_id = _normalize_chat_id(chat_id)
         payload = {
             "status": "done",
             "completed_at": datetime.now(timezone.utc).isoformat(),
@@ -167,6 +188,7 @@ class SupabaseRepo:
         task_no: int,
         patch: dict[str, Any],
     ) -> dict[str, Any] | None:
+        chat_id = _normalize_chat_id(chat_id)
         updated = await self._request(
             "PATCH",
             "tasks",
@@ -181,6 +203,7 @@ class SupabaseRepo:
         return updated[0] if updated else None
 
     async def delete_task_by_task_no(self, chat_id: str, task_no: int) -> dict[str, Any] | None:
+        chat_id = _normalize_chat_id(chat_id)
         deleted = await self._request(
             "DELETE",
             "tasks",
@@ -210,12 +233,26 @@ class SupabaseRepo:
                 "limit": "1000",
             },
         )
+        bindings = await self._request(
+            "GET",
+            "task_list_bindings",
+            params={
+                "select": "chat_id,list_chat_id",
+                "limit": "1000",
+            },
+        )
 
         chat_ids = {row["chat_id"] for row in (tasks or [])}
         chat_ids.update({row["chat_id"] for row in (profiles or [])})
+        for row in bindings or []:
+            chat_ids.add(str(row.get("chat_id") or ""))
+            chat_ids.add(str(row.get("list_chat_id") or ""))
+
+        chat_ids.discard("")
         return sorted(chat_ids)
 
     async def get_user_profile(self, chat_id: str) -> dict[str, Any]:
+        chat_id = _normalize_chat_id(chat_id)
         profile = await self._request(
             "GET",
             "user_profiles",
@@ -244,6 +281,7 @@ class SupabaseRepo:
         ordered_task_ids: list[int],
         rationale: dict[str, Any],
     ) -> None:
+        chat_id = _normalize_chat_id(chat_id)
         await self._request(
             "POST",
             "daily_plans",
@@ -255,6 +293,129 @@ class SupabaseRepo:
             },
             prefer="return=minimal",
         )
+
+    async def is_whitelisted_sender(self, sender_id: str) -> bool:
+        normalized = _normalize_phone(sender_id)
+        if not normalized:
+            return False
+
+        rows = await self._request(
+            "GET",
+            "whitelist_contacts",
+            params={
+                "select": "sender_id",
+                "sender_id": f"eq.{normalized}",
+                "limit": "1",
+            },
+        )
+        return bool(rows)
+
+    async def list_whitelist_contacts(self) -> list[dict[str, Any]]:
+        rows = await self._request(
+            "GET",
+            "whitelist_contacts",
+            params={
+                "select": "sender_id,label,created_at",
+                "order": "created_at.desc",
+                "limit": "1000",
+            },
+        )
+        return rows or []
+
+    async def upsert_whitelist_contact(self, sender_id: str, label: str = "") -> dict[str, Any]:
+        normalized = _normalize_phone(sender_id)
+        if not normalized:
+            raise ValueError("Invalid sender id")
+
+        rows = await self._request(
+            "POST",
+            "whitelist_contacts",
+            params={"on_conflict": "sender_id"},
+            json_data={
+                "sender_id": normalized,
+                "label": label.strip() if label else None,
+            },
+            prefer="return=representation,resolution=merge-duplicates",
+        )
+        return rows[0]
+
+    async def remove_whitelist_contact(self, sender_id: str) -> bool:
+        normalized = _normalize_phone(sender_id)
+        if not normalized:
+            return False
+
+        deleted = await self._request(
+            "DELETE",
+            "whitelist_contacts",
+            params={
+                "sender_id": f"eq.{normalized}",
+            },
+            prefer="return=representation",
+        )
+        return bool(deleted)
+
+    async def resolve_task_scope(self, chat_id: str) -> str:
+        normalized = _normalize_chat_id(chat_id)
+        if not normalized:
+            return normalized
+
+        rows = await self._request(
+            "GET",
+            "task_list_bindings",
+            params={
+                "select": "list_chat_id",
+                "chat_id": f"eq.{normalized}",
+                "limit": "1",
+            },
+        )
+        if rows:
+            return _normalize_chat_id(str(rows[0].get("list_chat_id") or normalized))
+        return normalized
+
+    async def list_task_bindings(self) -> list[dict[str, Any]]:
+        rows = await self._request(
+            "GET",
+            "task_list_bindings",
+            params={
+                "select": "chat_id,list_chat_id,created_at,updated_at",
+                "order": "updated_at.desc",
+                "limit": "1000",
+            },
+        )
+        return rows or []
+
+    async def upsert_task_binding(self, chat_id: str, list_chat_id: str) -> dict[str, Any]:
+        chat_norm = _normalize_chat_id(chat_id)
+        scope_norm = _normalize_chat_id(list_chat_id)
+        if not chat_norm or not scope_norm:
+            raise ValueError("Invalid chat id or list id")
+
+        rows = await self._request(
+            "POST",
+            "task_list_bindings",
+            params={"on_conflict": "chat_id"},
+            json_data={
+                "chat_id": chat_norm,
+                "list_chat_id": scope_norm,
+            },
+            prefer="return=representation,resolution=merge-duplicates",
+        )
+        return rows[0]
+
+    async def remove_task_binding(self, chat_id: str) -> bool:
+        chat_norm = _normalize_chat_id(chat_id)
+        if not chat_norm:
+            return False
+
+        deleted = await self._request(
+            "DELETE",
+            "task_list_bindings",
+            params={
+                "chat_id": f"eq.{chat_norm}",
+            },
+            prefer="return=representation",
+        )
+        return bool(deleted)
 
     async def health_check(self) -> dict[str, Any]:
         if not self.settings.supabase_url or not self.settings.supabase_service_role_key:

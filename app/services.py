@@ -31,12 +31,26 @@ class TaskService:
         self.whatsapp_client = whatsapp_client
         self.planner = planner
 
-    async def handle_message(self, chat_id: str, text: str, source_message_id: str | None = None) -> str:
-        command_reply = await self._dispatch_command(chat_id, text)
+    async def handle_message(
+        self,
+        chat_id: str,
+        text: str,
+        source_message_id: str | None = None,
+        sender_id: str | None = None,
+        is_group: bool = False,
+    ) -> str | None:
+        _ = is_group
+        sender = sender_id or chat_id
+        if not await self.repo.is_whitelisted_sender(sender):
+            return None
+
+        scope_chat_id = await self.repo.resolve_task_scope(chat_id)
+
+        command_reply = await self._dispatch_command(scope_chat_id, text)
         if command_reply is not None:
             return command_reply
 
-        profile = await self.repo.get_user_profile(chat_id)
+        profile = await self.repo.get_user_profile(scope_chat_id)
         timezone_name = profile.get("timezone") or self.settings.timezone
 
         parsed = parse_task_text(text, timezone_name)
@@ -45,7 +59,7 @@ class TaskService:
 
         created = await self.repo.create_task(
             {
-                "chat_id": chat_id,
+                "chat_id": scope_chat_id,
                 "title": parsed.title,
                 "due_at": parsed.due_at_utc,
                 "priority": parsed.priority,
@@ -71,7 +85,7 @@ class TaskService:
             f"優先度：{priority_label}",
         ]
 
-        order_hint = await self._build_new_task_order_hint(chat_id, created, profile)
+        order_hint = await self._build_new_task_order_hint(scope_chat_id, created, profile)
         if order_hint:
             lines.append(order_hint)
 
@@ -81,10 +95,11 @@ class TaskService:
         pushed = 0
         skipped = 0
 
-        for chat_id in await self.repo.list_active_chat_ids():
-            profile = await self.repo.get_user_profile(chat_id)
+        for recipient_chat_id in await self.repo.list_active_chat_ids():
+            scope_chat_id = await self.repo.resolve_task_scope(recipient_chat_id)
+            profile = await self.repo.get_user_profile(scope_chat_id)
             timezone_name = profile.get("timezone") or self.settings.timezone
-            today_tasks = await self._get_today_tasks(chat_id, timezone_name)
+            today_tasks = await self._get_today_tasks(scope_chat_id, timezone_name)
             local_tz = ZoneInfo(timezone_name)
             local_today = datetime.now(local_tz).date().isoformat()
 
@@ -92,7 +107,7 @@ class TaskService:
                 skipped += 1
                 continue
 
-            plan = await self.planner.rank_tasks_for_adhd(chat_id, today_tasks, profile)
+            plan = await self.planner.rank_tasks_for_adhd(scope_chat_id, today_tasks, profile)
             limited_tasks = plan["ordered_tasks"][: int(profile.get("max_daily_tasks") or self.settings.max_daily_tasks)]
 
             message = self._format_today_message(
@@ -102,10 +117,10 @@ class TaskService:
                 push_mode=True,
                 ai_sorted=not bool(plan.get("fallback", False)),
             )
-            await self.whatsapp_client.send_text_message(chat_id, message)
+            await self.whatsapp_client.send_text_message(recipient_chat_id, message)
 
             await self.repo.save_daily_plan(
-                chat_id=chat_id,
+                chat_id=scope_chat_id,
                 plan_date_iso=local_today,
                 ordered_task_ids=[int(t["id"]) for t in limited_tasks],
                 rationale={
@@ -118,22 +133,22 @@ class TaskService:
 
         return {"pushed": pushed, "skipped": skipped}
 
-    async def _dispatch_command(self, chat_id: str, text: str) -> str | None:
+    async def _dispatch_command(self, scope_chat_id: str, text: str) -> str | None:
         raw = text.strip()
         normalized = raw.lower()
 
         if normalized in {"list", "/list"}:
-            return await self._cmd_list(chat_id)
+            return await self._cmd_list(scope_chat_id)
 
         if normalized in {"today", "/today"}:
-            return await self._cmd_today(chat_id)
+            return await self._cmd_today(scope_chat_id)
 
         if normalized in {"help", "/help"}:
             return self._cmd_help()
 
         edit_match = re.match(r"^/?edit\s+(\d+)\s+(.+)$", raw, flags=re.IGNORECASE | re.DOTALL)
         if edit_match:
-            return await self._cmd_edit(chat_id, int(edit_match.group(1)), edit_match.group(2).strip())
+            return await self._cmd_edit(scope_chat_id, int(edit_match.group(1)), edit_match.group(2).strip())
 
         if re.match(r"^/?edit\b", raw, flags=re.IGNORECASE):
             return "請用：edit <id> <新內容>，例如：edit 3 明天 4pm 跟客開會。"
@@ -145,7 +160,7 @@ class TaskService:
                 return "請提供任務 ID，例如：delete 3 或 delete 3 5 8。"
             if len(task_ids) > 30:
                 return "一次最多可刪除 30 項任務，請分批執行。"
-            return await self._cmd_delete_many(chat_id, task_ids)
+            return await self._cmd_delete_many(scope_chat_id, task_ids)
 
         done_match = re.match(r"^/?done\b(.*)$", raw, flags=re.IGNORECASE)
         if done_match:
@@ -154,15 +169,15 @@ class TaskService:
                 return "請提供任務 ID，例如：done 3 或 done 3 5 8。"
             if len(task_ids) > 30:
                 return "一次最多可完成 30 項任務，請分批執行。"
-            return await self._cmd_done_many(chat_id, task_ids)
+            return await self._cmd_done_many(scope_chat_id, task_ids)
 
         return None
 
-    async def _cmd_list(self, chat_id: str) -> str:
-        profile = await self.repo.get_user_profile(chat_id)
+    async def _cmd_list(self, scope_chat_id: str) -> str:
+        profile = await self.repo.get_user_profile(scope_chat_id)
         timezone_name = profile.get("timezone") or self.settings.timezone
 
-        tasks = await self.repo.list_open_tasks(chat_id)
+        tasks = await self.repo.list_open_tasks(scope_chat_id)
         if not tasks:
             return "目前沒有待辦任務。"
 
@@ -177,15 +192,15 @@ class TaskService:
 
         return "\n".join(lines)
 
-    async def _cmd_today(self, chat_id: str) -> str:
-        profile = await self.repo.get_user_profile(chat_id)
+    async def _cmd_today(self, scope_chat_id: str) -> str:
+        profile = await self.repo.get_user_profile(scope_chat_id)
         timezone_name = profile.get("timezone") or self.settings.timezone
 
-        today_tasks = await self._get_today_tasks(chat_id, timezone_name)
+        today_tasks = await self._get_today_tasks(scope_chat_id, timezone_name)
         if not today_tasks:
             return "今天沒有排程任務。"
 
-        plan = await self.planner.rank_tasks_for_adhd(chat_id, today_tasks, profile)
+        plan = await self.planner.rank_tasks_for_adhd(scope_chat_id, today_tasks, profile)
         max_daily = int(profile.get("max_daily_tasks") or self.settings.max_daily_tasks)
         limited_tasks = plan["ordered_tasks"][:max_daily]
 
@@ -197,12 +212,12 @@ class TaskService:
             ai_sorted=not bool(plan.get("fallback", False)),
         )
 
-    async def _cmd_done_many(self, chat_id: str, task_ids: list[int]) -> str:
+    async def _cmd_done_many(self, scope_chat_id: str, task_ids: list[int]) -> str:
         completed: list[tuple[int, str]] = []
         not_found: list[int] = []
 
         for task_no in task_ids:
-            updated = await self.repo.mark_done_by_task_no(chat_id, task_no)
+            updated = await self.repo.mark_done_by_task_no(scope_chat_id, task_no)
             if not updated:
                 not_found.append(task_no)
                 continue
@@ -226,12 +241,12 @@ class TaskService:
 
         return "\n".join(lines) if lines else "找不到可完成的任務。"
 
-    async def _cmd_delete_many(self, chat_id: str, task_ids: list[int]) -> str:
+    async def _cmd_delete_many(self, scope_chat_id: str, task_ids: list[int]) -> str:
         deleted: list[tuple[int, str]] = []
         not_found: list[int] = []
 
         for task_no in task_ids:
-            removed = await self.repo.delete_task_by_task_no(chat_id, task_no)
+            removed = await self.repo.delete_task_by_task_no(scope_chat_id, task_no)
             if not removed:
                 not_found.append(task_no)
                 continue
@@ -254,11 +269,11 @@ class TaskService:
 
         return "\n".join(lines) if lines else "找不到可刪除的任務。"
 
-    async def _cmd_edit(self, chat_id: str, task_no: int, new_text: str) -> str:
-        profile = await self.repo.get_user_profile(chat_id)
+    async def _cmd_edit(self, scope_chat_id: str, task_no: int, new_text: str) -> str:
+        profile = await self.repo.get_user_profile(scope_chat_id)
         timezone_name = profile.get("timezone") or self.settings.timezone
 
-        existing = await self.repo.get_open_task_by_task_no(chat_id, task_no)
+        existing = await self.repo.get_open_task_by_task_no(scope_chat_id, task_no)
         if not existing:
             return f"找不到可編輯的任務 #{task_no}。"
 
@@ -275,7 +290,7 @@ class TaskService:
             "source_text": new_text,
         }
 
-        updated = await self.repo.update_task_by_task_no(chat_id, task_no, patch)
+        updated = await self.repo.update_task_by_task_no(scope_chat_id, task_no, patch)
         if not updated:
             return f"找不到可編輯的任務 #{task_no}。"
 
@@ -301,16 +316,16 @@ class TaskService:
 
     async def _build_new_task_order_hint(
         self,
-        chat_id: str,
+        scope_chat_id: str,
         created_task: dict[str, Any],
         profile: dict[str, Any],
     ) -> str:
         try:
-            open_tasks = await self.repo.list_open_tasks(chat_id, limit=100)
+            open_tasks = await self.repo.list_open_tasks(scope_chat_id, limit=100)
             if not open_tasks:
                 return ""
 
-            plan = await self.planner.rank_tasks_for_adhd(chat_id, open_tasks, profile)
+            plan = await self.planner.rank_tasks_for_adhd(scope_chat_id, open_tasks, profile)
             ordered_tasks = plan.get("ordered_tasks") or open_tasks
             ai_sorted = not bool(plan.get("fallback", False))
             method_label = "由AI排序" if ai_sorted else "由規則排序"
@@ -346,7 +361,7 @@ class TaskService:
             lines.append(f"{index}. #{_task_no(task)} {task['title']}")
         return "\n".join(lines)
 
-    async def _get_today_tasks(self, chat_id: str, timezone_name: str) -> list[dict[str, Any]]:
+    async def _get_today_tasks(self, scope_chat_id: str, timezone_name: str) -> list[dict[str, Any]]:
         local_tz = ZoneInfo(timezone_name)
         now_local = datetime.now(local_tz)
         start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -355,7 +370,7 @@ class TaskService:
         start_utc = start_local.astimezone(timezone.utc).isoformat()
         end_utc = end_local.astimezone(timezone.utc).isoformat()
 
-        return await self.repo.list_tasks_for_date(chat_id, start_utc, end_utc)
+        return await self.repo.list_tasks_for_date(scope_chat_id, start_utc, end_utc)
 
     def _format_today_message(
         self,

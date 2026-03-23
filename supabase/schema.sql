@@ -37,10 +37,24 @@ create table if not exists daily_plans (
   created_at timestamptz not null default now()
 );
 
+create table if not exists whitelist_contacts (
+  sender_id text primary key,
+  label text,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists task_list_bindings (
+  chat_id text primary key,
+  list_chat_id text not null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
 create index if not exists idx_tasks_chat_status_due on tasks (chat_id, status, due_at);
 create index if not exists idx_tasks_chat_created on tasks (chat_id, created_at desc);
 create index if not exists idx_daily_plans_chat_date on daily_plans (chat_id, plan_date desc);
 create unique index if not exists idx_tasks_chat_task_no on tasks (chat_id, task_no);
+create index if not exists idx_task_list_bindings_list_chat on task_list_bindings (list_chat_id);
 
 create or replace function set_updated_at()
 returns trigger as $$
@@ -91,3 +105,8 @@ drop trigger if exists trg_tasks_assign_task_no on tasks;
 create trigger trg_tasks_assign_task_no
 before insert on tasks
 for each row execute procedure assign_task_no();
+
+drop trigger if exists trg_task_list_bindings_updated_at on task_list_bindings;
+create trigger trg_task_list_bindings_updated_at
+before update on task_list_bindings
+for each row execute procedure set_updated_at();
