@@ -55,8 +55,27 @@ class AdminBindingUpsert(BaseModel):
     list_chat_id: str
 
 
+class AdminTaskListCreateRequest(BaseModel):
+    owner_chat_id: str
+    name: str
+    make_default_for_owner: bool = False
+
+
+class AdminTaskListMemberUpsertRequest(BaseModel):
+    list_id: int
+    chat_id: str
+    role: str = "member"
+    make_default: bool = False
+
+
+class AdminTaskListDefaultRequest(BaseModel):
+    list_id: int
+    chat_id: str
+
+
 class AdminBatchAddRequest(BaseModel):
     chat_id: str
+    list_id: int | None = None
     lines: list[str] = Field(default_factory=list)
 
 
@@ -67,11 +86,13 @@ class AdminBatchEditItem(BaseModel):
 
 class AdminBatchEditRequest(BaseModel):
     chat_id: str
+    list_id: int | None = None
     items: list[AdminBatchEditItem] = Field(default_factory=list)
 
 
 class AdminBatchDeleteRequest(BaseModel):
     chat_id: str
+    list_id: int | None = None
     task_nos: list[int] = Field(default_factory=list)
 
 
@@ -254,6 +275,62 @@ async def admin_delete_whitelist(request: Request, sender_id: str) -> dict[str, 
     return {"deleted": deleted}
 
 
+@app.get("/admin/api/lists")
+async def admin_list_task_lists(request: Request, chat_id: str | None = None) -> dict[str, Any]:
+    await _assert_admin_auth(request)
+    if chat_id:
+        items = await repo.list_task_lists_for_chat(chat_id)
+        return {"chat_id": chat_id, "items": items}
+    items = await repo.list_task_bindings()
+    return {"items": items}
+
+
+@app.post("/admin/api/lists")
+async def admin_create_task_list(request: Request, body: AdminTaskListCreateRequest) -> dict[str, Any]:
+    await _assert_admin_auth(request)
+    try:
+        item = await repo.create_task_list(
+            owner_chat_id=body.owner_chat_id,
+            name=body.name,
+            make_default_for_owner=bool(body.make_default_for_owner),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"item": item}
+
+
+@app.post("/admin/api/lists/members")
+async def admin_upsert_task_list_member(request: Request, body: AdminTaskListMemberUpsertRequest) -> dict[str, Any]:
+    await _assert_admin_auth(request)
+    try:
+        item = await repo.add_task_list_member(
+            chat_id=body.chat_id,
+            list_id=int(body.list_id),
+            role=body.role,
+            make_default=bool(body.make_default),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"item": item}
+
+
+@app.delete("/admin/api/lists/{list_id}/members/{chat_id}")
+async def admin_remove_task_list_member(request: Request, list_id: int, chat_id: str) -> dict[str, bool]:
+    await _assert_admin_auth(request)
+    deleted = await repo.remove_task_list_member(chat_id=chat_id, list_id=int(list_id))
+    return {"deleted": deleted}
+
+
+@app.post("/admin/api/lists/default")
+async def admin_set_default_task_list(request: Request, body: AdminTaskListDefaultRequest) -> dict[str, Any]:
+    await _assert_admin_auth(request)
+    try:
+        item = await repo.set_default_task_list(chat_id=body.chat_id, list_id=int(body.list_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"item": item}
+
+
 @app.get("/admin/api/bindings")
 async def admin_list_bindings(request: Request) -> dict[str, list[dict[str, Any]]]:
     await _assert_admin_auth(request)
@@ -283,19 +360,28 @@ async def admin_list_tasks(
     request: Request,
     chat_id: str,
     status: str = "open",
+    list_id: int | None = None,
 ) -> dict[str, Any]:
     await _assert_admin_auth(request)
     if status not in {"open", "done", "all"}:
         raise HTTPException(status_code=400, detail="status must be open, done, or all")
 
-    scope_chat_id = await repo.resolve_task_scope(chat_id)
-    profile = await repo.get_user_profile(scope_chat_id)
+    try:
+        scope = await repo.resolve_task_scope_info(chat_id, list_id=list_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    scope_chat_id = str(scope["scope_chat_id"])
+    scope_list_id = int(scope["list_id"])
+    profile = await repo.get_user_profile(chat_id)
     timezone_name = profile.get("timezone") or settings.timezone
-    tasks = await repo.list_tasks(scope_chat_id, status=status)
+    tasks = await repo.list_tasks(scope_chat_id, status=status, list_id=scope_list_id)
 
     return {
         "chat_id": chat_id,
         "scope_chat_id": scope_chat_id,
+        "list_id": scope_list_id,
+        "list_name": str(scope.get("list_name") or ""),
         "timezone": timezone_name,
         "status": status,
         "tasks": [_serialize_task_for_admin(task, timezone_name) for task in tasks],
@@ -311,8 +397,14 @@ async def admin_batch_add_tasks(request: Request, body: AdminBatchAddRequest) ->
     if len(lines) > 100:
         raise HTTPException(status_code=400, detail="At most 100 lines per request")
 
-    scope_chat_id = await repo.resolve_task_scope(body.chat_id)
-    profile = await repo.get_user_profile(scope_chat_id)
+    try:
+        scope = await repo.resolve_task_scope_info(body.chat_id, list_id=body.list_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    scope_chat_id = str(scope["scope_chat_id"])
+    scope_list_id = int(scope["list_id"])
+    profile = await repo.get_user_profile(body.chat_id)
     timezone_name = profile.get("timezone") or settings.timezone
 
     created_items: list[dict[str, Any]] = []
@@ -327,6 +419,7 @@ async def admin_batch_add_tasks(request: Request, body: AdminBatchAddRequest) ->
         created = await repo.create_task(
             {
                 "chat_id": scope_chat_id,
+                "list_id": scope_list_id,
                 "title": parsed.title,
                 "due_at": parsed.due_at_utc,
                 "priority": parsed.priority,
@@ -345,6 +438,8 @@ async def admin_batch_add_tasks(request: Request, body: AdminBatchAddRequest) ->
     return {
         "chat_id": body.chat_id,
         "scope_chat_id": scope_chat_id,
+        "list_id": scope_list_id,
+        "list_name": str(scope.get("list_name") or ""),
         "created_count": len(created_items),
         "failed_count": len(failed_items),
         "created_items": created_items,
@@ -360,8 +455,14 @@ async def admin_batch_edit_tasks(request: Request, body: AdminBatchEditRequest) 
     if len(body.items) > 100:
         raise HTTPException(status_code=400, detail="At most 100 edits per request")
 
-    scope_chat_id = await repo.resolve_task_scope(body.chat_id)
-    profile = await repo.get_user_profile(scope_chat_id)
+    try:
+        scope = await repo.resolve_task_scope_info(body.chat_id, list_id=body.list_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    scope_chat_id = str(scope["scope_chat_id"])
+    scope_list_id = int(scope["list_id"])
+    profile = await repo.get_user_profile(body.chat_id)
     timezone_name = profile.get("timezone") or settings.timezone
 
     updated_items: list[dict[str, Any]] = []
@@ -373,7 +474,7 @@ async def admin_batch_edit_tasks(request: Request, body: AdminBatchEditRequest) 
             failed_items.append({"task_no": str(task_no), "error": "Invalid task id"})
             continue
 
-        existing = await repo.get_open_task_by_task_no(scope_chat_id, task_no)
+        existing = await repo.get_open_task_by_task_no(scope_chat_id, task_no, list_id=scope_list_id)
         if not existing:
             failed_items.append({"task_no": str(task_no), "error": "Task not found or already done"})
             continue
@@ -391,7 +492,7 @@ async def admin_batch_edit_tasks(request: Request, body: AdminBatchEditRequest) 
             "energy_need": parsed.energy_need,
             "source_text": item.text.strip(),
         }
-        updated = await repo.update_task_by_task_no(scope_chat_id, task_no, patch)
+        updated = await repo.update_task_by_task_no(scope_chat_id, task_no, patch, list_id=scope_list_id)
         if not updated:
             failed_items.append({"task_no": str(task_no), "error": "Update failed"})
             continue
@@ -400,6 +501,8 @@ async def admin_batch_edit_tasks(request: Request, body: AdminBatchEditRequest) 
     return {
         "chat_id": body.chat_id,
         "scope_chat_id": scope_chat_id,
+        "list_id": scope_list_id,
+        "list_name": str(scope.get("list_name") or ""),
         "updated_count": len(updated_items),
         "failed_count": len(failed_items),
         "updated_items": updated_items,
@@ -417,12 +520,18 @@ async def admin_batch_delete_tasks(request: Request, body: AdminBatchDeleteReque
     if len(task_nos) > 200:
         raise HTTPException(status_code=400, detail="At most 200 ids per request")
 
-    scope_chat_id = await repo.resolve_task_scope(body.chat_id)
+    try:
+        scope = await repo.resolve_task_scope_info(body.chat_id, list_id=body.list_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    scope_chat_id = str(scope["scope_chat_id"])
+    scope_list_id = int(scope["list_id"])
     deleted: list[int] = []
     not_found: list[int] = []
 
     for task_no in task_nos:
-        removed = await repo.delete_task_by_task_no(scope_chat_id, task_no)
+        removed = await repo.delete_task_by_task_no(scope_chat_id, task_no, list_id=scope_list_id)
         if removed:
             deleted.append(task_no)
         else:
@@ -431,6 +540,8 @@ async def admin_batch_delete_tasks(request: Request, body: AdminBatchDeleteReque
     return {
         "chat_id": body.chat_id,
         "scope_chat_id": scope_chat_id,
+        "list_id": scope_list_id,
+        "list_name": str(scope.get("list_name") or ""),
         "deleted_count": len(deleted),
         "not_found_count": len(not_found),
         "deleted": deleted,
@@ -886,6 +997,7 @@ def _serialize_task_for_admin(task: dict[str, Any], timezone_name: str) -> dict[
 
     return {
         "id": int(task.get("id") or 0),
+        "list_id": int(task.get("list_id") or 0) if task.get("list_id") not in (None, "") else None,
         "task_no": int(task.get("task_no") or task.get("id") or 0),
         "title": str(task.get("title") or ""),
         "priority": int(task.get("priority") or 2),
@@ -1085,23 +1197,34 @@ def _render_admin_html() -> str:
           </div>
 
           <div class="card">
-            <h2>Shared Task Lists</h2>
+            <h2>Task Lists / Sharing</h2>
             <div class="row">
               <div>
-                <label for="bind-chat">Chat ID / Phone</label>
+                <label for="newlist-owner">Owner Chat ID</label>
+                <input id="newlist-owner" placeholder="85291234567" />
+              </div>
+              <div>
+                <label for="newlist-name">New List Name</label>
+                <input id="newlist-name" placeholder="Team A / Private / Sales" />
+              </div>
+              <button id="newlist-create" style="align-self:end;width:120px;">Create</button>
+            </div>
+            <div class="row">
+              <div>
+                <label for="bind-chat">Member Chat ID</label>
                 <input id="bind-chat" placeholder="85291234567 or group id" />
               </div>
               <div>
-                <label for="bind-list">List Owner Chat ID</label>
-                <input id="bind-list" placeholder="85290001111" />
+                <label for="bind-list">Target List ID / Owner Chat ID</label>
+                <input id="bind-list" placeholder="#12 或 85290001111" />
               </div>
-              <button id="bind-save" style="align-self:end;width:120px;">Save</button>
+              <button id="bind-save" style="align-self:end;width:120px;">Add Member</button>
             </div>
             <div class="inline-actions" style="margin-bottom:8px;">
               <button class="secondary" id="bind-refresh">Refresh</button>
             </div>
             <table>
-              <thead><tr><th>chat_id</th><th>list_chat_id</th><th>updated_at</th><th></th></tr></thead>
+              <thead><tr><th>chat_id</th><th>list</th><th>default</th><th>updated_at</th><th></th></tr></thead>
               <tbody id="bind-tbody"></tbody>
             </table>
           </div>
@@ -1113,6 +1236,10 @@ def _render_admin_html() -> str:
             <div>
               <label for="task-chat-id">Chat ID / Phone</label>
               <input id="task-chat-id" placeholder="85291234567 or group id" />
+            </div>
+            <div>
+              <label for="task-list-id">List ID (optional)</label>
+              <input id="task-list-id" placeholder="#12" />
             </div>
             <div>
               <label for="task-status">Status</label>
@@ -1256,16 +1383,36 @@ def _render_admin_html() -> str:
           const tr = document.createElement("tr");
           tr.innerHTML = `
             <td>${{item.chat_id || ""}}</td>
-            <td>${{item.list_chat_id || ""}}</td>
+            <td>#${{item.list_id || ""}} ${{item.list_name || ""}}</td>
+            <td>${{item.is_default ? "yes" : "no"}}</td>
             <td>${{item.updated_at || ""}}</td>
-            <td><button class="danger" data-del="${{item.chat_id || ""}}">Delete</button></td>
+            <td>
+              <button class="secondary" data-def-chat="${{item.chat_id || ""}}" data-def-list="${{item.list_id || ""}}">Set Default</button>
+              <button class="danger" data-del-chat="${{item.chat_id || ""}}" data-del-list="${{item.list_id || ""}}">Remove</button>
+            </td>
           `;
           tbody.appendChild(tr);
         }}
-        for (const btn of tbody.querySelectorAll("button[data-del]")) {{
+        for (const btn of tbody.querySelectorAll("button[data-def-list]")) {{
           btn.addEventListener("click", async () => {{
             try {{
-              await api(`/admin/api/bindings/${{encodeURIComponent(btn.dataset.del)}}`, {{ method: "DELETE" }});
+              await api("/admin/api/lists/default", {{
+                method: "POST",
+                body: JSON.stringify({{
+                  chat_id: btn.dataset.defChat,
+                  list_id: Number(btn.dataset.defList),
+                }})
+              }});
+              await loadBindings();
+            }} catch (err) {{
+              if (err.message !== "Unauthorized") alert(err.message);
+            }}
+          }});
+        }}
+        for (const btn of tbody.querySelectorAll("button[data-del-list]")) {{
+          btn.addEventListener("click", async () => {{
+            try {{
+              await api(`/admin/api/lists/${{encodeURIComponent(btn.dataset.delList)}}/members/${{encodeURIComponent(btn.dataset.delChat)}}`, {{ method: "DELETE" }});
               await loadBindings();
             }} catch (err) {{
               if (err.message !== "Unauthorized") alert(err.message);
@@ -1279,6 +1426,15 @@ def _render_admin_html() -> str:
         return document.getElementById("task-chat-id").value.trim();
       }}
 
+      function currentTaskListId() {{
+        const raw = document.getElementById("task-list-id").value.trim();
+        if (!raw) return null;
+        const clean = raw.startsWith("#") ? raw.slice(1) : raw;
+        const listId = Number(clean);
+        if (!Number.isFinite(listId) || listId <= 0) return null;
+        return Math.floor(listId);
+      }}
+
       async function loadTasks() {{
         const chatId = currentTaskChatId();
         if (!chatId) {{
@@ -1286,7 +1442,9 @@ def _render_admin_html() -> str:
           return;
         }}
         const status = document.getElementById("task-status").value;
-        const data = await api(`/admin/api/tasks?chat_id=${{encodeURIComponent(chatId)}}&status=${{encodeURIComponent(status)}}`);
+        const listId = currentTaskListId();
+        const listParam = listId ? `&list_id=${{encodeURIComponent(String(listId))}}` : "";
+        const data = await api(`/admin/api/tasks?chat_id=${{encodeURIComponent(chatId)}}&status=${{encodeURIComponent(status)}}${{listParam}}`);
         const tbody = document.getElementById("task-tbody");
         tbody.innerHTML = "";
         for (const task of data.tasks || []) {{
@@ -1303,6 +1461,8 @@ def _render_admin_html() -> str:
         showResult({{
           chat_id: data.chat_id,
           scope_chat_id: data.scope_chat_id,
+          list_id: data.list_id,
+          list_name: data.list_name,
           timezone: data.timezone,
           task_count: (data.tasks || []).length
         }});
@@ -1379,12 +1539,36 @@ def _render_admin_html() -> str:
         }}
       }});
 
+      document.getElementById("newlist-create").addEventListener("click", async () => {{
+        try {{
+          const owner_chat_id = document.getElementById("newlist-owner").value.trim();
+          const name = document.getElementById("newlist-name").value.trim();
+          if (!owner_chat_id || !name) {{
+            alert("請輸入 owner_chat_id 和 list name");
+            return;
+          }}
+          const data = await api("/admin/api/lists", {{
+            method: "POST",
+            body: JSON.stringify({{
+              owner_chat_id,
+              name,
+              make_default_for_owner: false
+            }})
+          }});
+          showResult(data);
+          await loadBindings();
+        }} catch (err) {{
+          if (err.message !== "Unauthorized") alert(err.message);
+        }}
+      }});
+
       document.getElementById("bind-refresh").addEventListener("click", () => loadBindings().catch(err => err.message !== "Unauthorized" && alert(err.message)));
       document.getElementById("task-load").addEventListener("click", () => loadTasks().catch(err => err.message !== "Unauthorized" && alert(err.message)));
 
       document.getElementById("batch-add-btn").addEventListener("click", async () => {{
         try {{
           const chat_id = currentTaskChatId();
+          const list_id = currentTaskListId();
           if (!chat_id) {{
             alert("請先輸入 Chat ID / Phone");
             return;
@@ -1392,7 +1576,7 @@ def _render_admin_html() -> str:
           const lines = document.getElementById("batch-add-lines").value.split("\\n").map(s => s.trim()).filter(Boolean);
           const data = await api("/admin/api/tasks/batch-add", {{
             method: "POST",
-            body: JSON.stringify({{ chat_id, lines }})
+            body: JSON.stringify({{ chat_id, list_id, lines }})
           }});
           showResult(data);
           await loadTasks();
@@ -1404,6 +1588,7 @@ def _render_admin_html() -> str:
       document.getElementById("batch-edit-btn").addEventListener("click", async () => {{
         try {{
           const chat_id = currentTaskChatId();
+          const list_id = currentTaskListId();
           if (!chat_id) {{
             alert("請先輸入 Chat ID / Phone");
             return;
@@ -1424,7 +1609,7 @@ def _render_admin_html() -> str:
           }}
           const data = await api("/admin/api/tasks/batch-edit", {{
             method: "POST",
-            body: JSON.stringify({{ chat_id, items }})
+            body: JSON.stringify({{ chat_id, list_id, items }})
           }});
           showResult(data);
           await loadTasks();
@@ -1436,6 +1621,7 @@ def _render_admin_html() -> str:
       document.getElementById("batch-delete-btn").addEventListener("click", async () => {{
         try {{
           const chat_id = currentTaskChatId();
+          const list_id = currentTaskListId();
           if (!chat_id) {{
             alert("請先輸入 Chat ID / Phone");
             return;
@@ -1448,7 +1634,7 @@ def _render_admin_html() -> str:
           }}
           const data = await api("/admin/api/tasks/batch-delete", {{
             method: "POST",
-            body: JSON.stringify({{ chat_id, task_nos }})
+            body: JSON.stringify({{ chat_id, list_id, task_nos }})
           }});
           showResult(data);
           await loadTasks();

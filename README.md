@@ -3,10 +3,12 @@
 這是一個可部署在 Vercel 的 WhatsApp 工作任務機器人，支援：
 - 自然語言轉任務（日期、時間、優先度）
 - `list` / `today` / `done <id...>` / `delete <id...>` / `edit <id> <text>` 指令
+- `lists` / `newlist <name>` / `use <list>` / `share` / `unshare` 多清單指令
 - 每日推播今日任務
 - 串接 OpenAI API，按 ADHD 友善方式安排順序
 - 白名單控制（只有白名單電話可觸發 bot 回覆）
-- 共享 task list（多個電話號碼可共用同一份任務清單）
+- 多 Task List（同一電話可擁有多份清單）
+- 共享 task list（多個電話號碼可共用同一份清單）
 - Web 管理介面（批量 add/edit/delete 任務）
 
 ## 1. 專案結構
@@ -27,7 +29,7 @@ vercel.json                # Vercel routes + cron
 
 1. 在 Supabase Dashboard 建立專案
 2. 打開 SQL Editor，貼上 [`supabase/schema.sql`](supabase/schema.sql)
-   (如你已有舊資料庫，請重新執行一次作 migration，會加入 `task_no`、`whitelist_contacts`、`task_list_bindings`、`admin_users` 等欄位/資料表)
+   (如你已有舊資料庫，請重新執行一次作 migration，會加入 `task_lists`、`task_list_members`、`tasks.list_id`、`admin_users` 等欄位/資料表)
 3. 執行後取得：
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
@@ -89,10 +91,15 @@ Webhook 驗證 URL：
 
 - `list`: 列出所有待辦
 - `today`: 今日建議順序（會嘗試用 OpenAI 排序）
+- `lists`: 列出可用清單
+- `newlist Personal`: 建立新清單並切換
+- `use 12`: 切換到清單 #12
+- `share 12 85291234567`: 分享清單 #12
+- `unshare 12 85291234567`: 取消分享清單 #12
 - `done 3 5 8`: 一次完成多項任務
 - `delete 3 5`: 一次刪除多項任務
 - `edit 3 明天 4pm 跟客開會`: 修改任務 #3 內容
-- 任務編號 `#id` 以每個聊天範圍（單聊=電話號碼，群組=group chat）獨立重新計數
+- 任務編號 `#id` 以每個 task list 重新計數
 - 若有日期但無時間，預設排在 `12:00`
 - 自然語言：`下星期二 3pm 同客開會`
 
@@ -112,7 +119,8 @@ Webhook 驗證 URL：
 
 功能：
 - 白名單：新增 / 修改 / 刪除可回應 bot 的電話號碼
-- Shared list：設定 `chat_id -> list_chat_id`，讓多個 chat 共用同一份 task list
+- Task Lists：建立新清單、為成員設定預設清單
+- Shared list：把 member chat 加入指定 list（一個 chat 可加入多個 list）
 - Tasks 批量操作：
   - Batch Add：每行一個自然語言任務（會自動解析時間、優先度）
   - Batch Edit：格式 `task_id | 新內容`
@@ -120,7 +128,7 @@ Webhook 驗證 URL：
 
 備註：
 - bot 收到訊息時先檢查 `sender_id` 是否在白名單，不在則忽略
-- 任務編號 `task_no` 會以每個 task list（`chat_id`）獨立重新計數
+- 任務編號 `task_no` 會以每個 task list（`list_id`）獨立重新計數
 
 ### 建立 admin 用戶（Supabase 手動）
 
