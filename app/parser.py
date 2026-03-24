@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from calendar import monthrange
 
 import dateparser
 from dateparser.search import search_dates
@@ -48,6 +49,42 @@ WEEK_OFFSET_MAP = {
     "这": 0,
     "呢": 0,
     "本": 0,
+    "": 0,
+}
+NAMED_DAY_PATTERN = re.compile(
+    r"(?P<full>大後天|大后天|大後日|大后日|後天|后天|後日|后日|聽日|听日|明天|明日|今天|今日)"
+)
+NAMED_DAY_OFFSET = {
+    "今天": 0,
+    "今日": 0,
+    "明天": 1,
+    "明日": 1,
+    "聽日": 1,
+    "听日": 1,
+    "後天": 2,
+    "后天": 2,
+    "後日": 2,
+    "后日": 2,
+    "大後天": 3,
+    "大后天": 3,
+    "大後日": 3,
+    "大后日": 3,
+}
+MONTH_ANCHOR_PATTERN = re.compile(
+    r"(?P<full>(?P<prefix>下下個月|下下个月|下個月|下个月|今個月|今个月|這個月|这个月|本月|呢個月|呢个月)?\\s*(?P<anchor>月尾|月末|月底|月頭|月头|月初))"
+)
+MONTH_PREFIX_OFFSET = {
+    "下下個月": 2,
+    "下下个月": 2,
+    "下個月": 1,
+    "下个月": 1,
+    "今個月": 0,
+    "今个月": 0,
+    "這個月": 0,
+    "这个月": 0,
+    "本月": 0,
+    "呢個月": 0,
+    "呢个月": 0,
     "": 0,
 }
 
@@ -131,9 +168,19 @@ def _compute_relative_weekday_due(
     )
 
     date_fragment = (match.group("full") or "").strip()
+    return _apply_time_from_remainder(due_local, timezone_name, source_text, date_fragment)
+
+
+def _apply_time_from_remainder(
+    due_local: datetime,
+    timezone_name: str,
+    source_text: str,
+    date_fragment: str,
+) -> tuple[datetime, list[str]]:
+    local_tz = ZoneInfo(timezone_name)
     fragments = [date_fragment] if date_fragment else []
 
-    remainder = source_text.replace(date_fragment, " ", 1)
+    remainder = source_text.replace(date_fragment, " ", 1) if date_fragment else source_text
     parser_settings = {
         "PREFER_DATES_FROM": "future",
         "TIMEZONE": timezone_name,
@@ -165,6 +212,77 @@ def _compute_relative_weekday_due(
     return due_local, fragments
 
 
+def _add_months(year: int, month: int, offset: int) -> tuple[int, int]:
+    month_index = (year * 12 + (month - 1)) + offset
+    target_year = month_index // 12
+    target_month = (month_index % 12) + 1
+    return target_year, target_month
+
+
+def _compute_named_relative_due(
+    text: str,
+    now_local: datetime,
+    timezone_name: str,
+) -> tuple[datetime, list[str]] | None:
+    day_match = NAMED_DAY_PATTERN.search(text)
+    if day_match:
+        token = (day_match.group("full") or "").strip()
+        offset = NAMED_DAY_OFFSET.get(token)
+        if offset is not None:
+            local_tz = ZoneInfo(timezone_name)
+            target_date = now_local.date() + timedelta(days=offset)
+            due_local = datetime(
+                year=target_date.year,
+                month=target_date.month,
+                day=target_date.day,
+                hour=12,
+                minute=0,
+                second=0,
+                microsecond=0,
+                tzinfo=local_tz,
+            )
+            return _apply_time_from_remainder(due_local, timezone_name, text, token)
+
+    month_match = MONTH_ANCHOR_PATTERN.search(text)
+    if month_match:
+        full = (month_match.group("full") or "").strip()
+        prefix = (month_match.group("prefix") or "").strip()
+        anchor = (month_match.group("anchor") or "").strip()
+        month_offset = MONTH_PREFIX_OFFSET.get(prefix, 0)
+
+        year, month = _add_months(now_local.year, now_local.month, month_offset)
+        if anchor in {"月頭", "月头", "月初"}:
+            day = 1
+        else:
+            day = monthrange(year, month)[1]
+
+        target_date = datetime(year=year, month=month, day=day).date()
+
+        # If no explicit month prefix, keep future bias for month anchors.
+        if not prefix and target_date < now_local.date():
+            year, month = _add_months(year, month, 1)
+            if anchor in {"月頭", "月头", "月初"}:
+                day = 1
+            else:
+                day = monthrange(year, month)[1]
+            target_date = datetime(year=year, month=month, day=day).date()
+
+        local_tz = ZoneInfo(timezone_name)
+        due_local = datetime(
+            year=target_date.year,
+            month=target_date.month,
+            day=target_date.day,
+            hour=12,
+            minute=0,
+            second=0,
+            microsecond=0,
+            tzinfo=local_tz,
+        )
+        return _apply_time_from_remainder(due_local, timezone_name, text, full)
+
+    return None
+
+
 def parse_task_text(text: str, timezone_name: str) -> ParsedTask:
     cleaned = text.strip()
     if not cleaned:
@@ -190,11 +308,16 @@ def parse_task_text(text: str, timezone_name: str) -> ParsedTask:
     due_local = None
     matched_fragments: list[str] = []
 
-    relative_match = RELATIVE_WEEKDAY_PATTERN.search(cleaned)
-    if relative_match:
-        relative_due = _compute_relative_weekday_due(relative_match, now_local, timezone_name, cleaned)
-        if relative_due:
-            due_local, matched_fragments = relative_due
+    named_relative = _compute_named_relative_due(cleaned, now_local, timezone_name)
+    if named_relative:
+        due_local, matched_fragments = named_relative
+
+    if due_local is None:
+        relative_match = RELATIVE_WEEKDAY_PATTERN.search(cleaned)
+        if relative_match:
+            relative_due = _compute_relative_weekday_due(relative_match, now_local, timezone_name, cleaned)
+            if relative_due:
+                due_local, matched_fragments = relative_due
 
     if due_local is None:
         matches = search_dates(cleaned, languages=["zh", "en"], settings=parser_settings)

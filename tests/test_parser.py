@@ -1,4 +1,7 @@
 from app.parser import parse_task_text
+from calendar import monthrange
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 
 def test_parse_with_due_time_and_title() -> None:
@@ -23,3 +26,27 @@ def test_parse_relative_weekday_without_time() -> None:
     parsed = parse_task_text("下禮拜二 同客開會", "Asia/Hong_Kong")
     assert parsed.due_at_utc is not None
     assert parsed.title == "同客開會"
+
+
+def test_parse_named_relative_day() -> None:
+    parsed = parse_task_text("後天 4pm 跟進客戶", "Asia/Hong_Kong")
+    assert parsed.due_at_utc is not None
+    assert parsed.title == "跟進客戶"
+
+
+def test_parse_month_anchor() -> None:
+    parsed = parse_task_text("月尾 結算", "Asia/Hong_Kong")
+    assert parsed.due_at_utc is not None
+
+    local_due = datetime.fromisoformat(parsed.due_at_utc).astimezone(ZoneInfo("Asia/Hong_Kong"))
+    assert local_due.day == monthrange(local_due.year, local_due.month)[1]
+
+
+def test_parse_next_month_start_with_time() -> None:
+    parsed = parse_task_text("下個月頭 10:00 交租", "Asia/Hong_Kong")
+    assert parsed.due_at_utc is not None
+    assert parsed.title == "交租"
+
+    local_due = datetime.fromisoformat(parsed.due_at_utc).astimezone(ZoneInfo("Asia/Hong_Kong"))
+    assert local_due.day == 1
+    assert local_due.hour == 10
